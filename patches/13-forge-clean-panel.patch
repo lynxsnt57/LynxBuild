@@ -1,0 +1,201 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 2123044..982d382 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -63,7 +63,32 @@ namespace CppProject
+ 		return 0.0;
+ 	}
+ 
+-	// Inspect only the Fabric metadata entry, never extract files or run code.
++	// Extract only ordinary quoted fields in [[mods]] sections. This is not a
++	// full TOML parser; unknown/dynamic fields are shown as Unknown.
++	struct ForgeModInfo { QString id; QString name; QString version; };
++	static QList<ForgeModInfo> mod_forge_metadata(const QByteArray& data)
++	{
++		QList<ForgeModInfo> result;
++		QString text=QString::fromUtf8(data); bool inMod=false;
++		const QRegularExpression section("^\\s*\\[\\[mods\\]\\]\\s*(?:#.*)?$");
++		const QRegularExpression otherSection("^\\s*\\[");
++		const QRegularExpression field("^\\s*(modId|displayName|version)\\s*=\\s*(?:\"([^\"\\\\]*)\"|'([^']*)')\\s*(?:#.*)?$");
++		for (const QString& raw:text.split('\n')) {
++			QString line=raw.trimmed();
++			if(section.match(line).hasMatch()) { result.append(ForgeModInfo{}); inMod=true; continue; }
++			if(otherSection.match(line).hasMatch()) { inMod=false; continue; }
++			if(!inMod || result.isEmpty()) continue;
++			auto match=field.match(line); if(!match.hasMatch()) continue;
++			QString key=match.captured(1), val=match.capturedStart(2)>=0?match.captured(2):match.captured(3);
++			val.replace(QRegularExpression("[\\x00-\\x1F\\x7F]"), " "); val=val.trimmed().left(100);
++			if(key=="modId") result.last().id=val;
++			else if(key=="displayName") result.last().name=val;
++			else result.last().version=val;
++		}
++		return result;
++	}
++
++	// Inspect Fabric or Forge metadata, never extract files or run code.
+ 	StringType mod_inspect_fabric(StringType path)
+ 	{
+ 		int err = 0;
+@@ -78,7 +103,7 @@ namespace CppProject
+ 		const zip_int64_t count = zip_get_num_entries(archive, 0);
+ 		if (count < 0 || count > 100000)
+ 			return fail("Archive has an invalid or excessive number of entries.");
+-		zip_int64_t metadataIndex = -1;
++		zip_int64_t metadataIndex = -1, forgeIndex = -1;
+ 		int blocks = 0, models = 0, textures = 0;
+ 		for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(count); ++i)
+ 		{
+@@ -89,28 +114,43 @@ namespace CppProject
+ 				if (metadataIndex >= 0) return fail("Duplicate Fabric metadata entries.");
+ 				metadataIndex = static_cast<zip_int64_t>(i);
+ 			}
++			if (name == "META-INF/mods.toml") {
++				if (forgeIndex >= 0) return fail("Duplicate Forge metadata entries.");
++				forgeIndex = static_cast<zip_int64_t>(i);
++			}
+ 			if (!name.startsWith("assets/") || name.endsWith('/')) continue;
+ 			if (name.contains("/blockstates/") && name.endsWith(".json")) ++blocks;
+ 			if (name.contains("/models/block/") && name.endsWith(".json")) ++models;
+ 			if (name.contains("/textures/") && name.endsWith(".png")) ++textures;
+ 		}
+-		if (metadataIndex < 0) return fail("No fabric.mod.json found. Not a supported Fabric mod.");
++		bool forge=metadataIndex<0 && forgeIndex>=0;
++		if (metadataIndex < 0 && forgeIndex < 0) return fail("No Fabric or Forge metadata found. Older Forge or NeoForge formats may not be supported.");
++		if(forge) metadataIndex=forgeIndex;
+ 		zip_stat_t stat;
+ 		zip_stat_init(&stat);
+ 		if (zip_stat_index(archive, metadataIndex, 0, &stat) != 0 || !(stat.valid & ZIP_STAT_SIZE) || stat.size > 262144)
+-			return fail("Fabric metadata is missing or too large.");
++			return fail("Mod metadata is missing or too large.");
+ 		zip_file_t* file = zip_fopen_index(archive, metadataIndex, 0);
+-		if (!file) return fail("Cannot open Fabric metadata.");
++		if (!file) return fail("Cannot open mod metadata.");
+ 		QByteArray data;
+ 		data.resize(static_cast<int>(stat.size));
+ 		zip_uint64_t pos = 0;
+ 		while (pos < stat.size) {
+ 			zip_int64_t n = zip_fread(file, data.data() + pos, stat.size - pos);
+-			if (n <= 0) { zip_fclose(file); return fail("Cannot read Fabric metadata."); }
++			if (n <= 0) { zip_fclose(file); return fail("Cannot read mod metadata."); }
+ 			pos += static_cast<zip_uint64_t>(n);
+ 		}
+-		if (zip_fclose(file) != 0) return fail("Invalid or corrupt Fabric metadata.");
++		if (zip_fclose(file) != 0) return fail("Invalid or corrupt mod metadata.");
+ 		zip_close(archive);
++		if(forge) {
++			QList<ForgeModInfo> mods=mod_forge_metadata(data);
++			if(mods.isEmpty() || mods.first().id.isEmpty()) return "Forge metadata present, but a simple mod ID could not be read.";
++			const ForgeModInfo& mod=mods.first();
++			QString out="Loader: Forge\nName: "+(mod.name.isEmpty()?mod.id:mod.name)+"\nID: "+mod.id+"\nVersion: "+(mod.version.isEmpty()?QString("Unknown"):mod.version);
++			if(mods.size()>1) out+=QString("\nMods in archive: %1 (showing the first)").arg(mods.size());
++			out+=QString("\nBlockstates: %1\nBlock model JSON files: %2\nTexture PNG files: %3").arg(blocks).arg(models).arg(textures);
++			return out+"\nInspection only. No assets imported.";
++		}
+ 		QJsonParseError parseError;
+ 		QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+ 		if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+@@ -125,7 +165,7 @@ namespace CppProject
+ 		if (id == "Unknown") return "Fabric metadata has no mod ID.";
+ 		QString name = clean(meta.value("name").toString(id));
+ 		QString version = clean(meta.value("version").toString());
+-		QString out = "Name: " + name + "\nID: " + id + "\nVersion: " + version;
++		QString out = "Loader: Fabric\nName: " + name + "\nID: " + id + "\nVersion: " + version;
+ 		out += QString("\nBlockstates: %1\nBlock model JSON files: %2\nTexture PNG files: %3").arg(blocks).arg(models).arg(textures);
+ 		out += "\nInspection only. No assets imported.";
+ 		return out;
+@@ -759,8 +799,16 @@ namespace CppProject
+ 			out = doc.object(); return true;
+ 		};
+ 		QJsonObject metadata;
+-		if (!readJson("fabric.mod.json", metadata) || !metadata.value("id").isString()) return "ERROR: Valid Fabric metadata not found.";
+-		if (metadata.value("id").toString() == "cobblemon") return mod_browse_cobblemon(entries, readEntry);
++		if (entries.contains("fabric.mod.json")) {
++			if (!readJson("fabric.mod.json", metadata) || !metadata.value("id").isString()) return "ERROR: Valid Fabric metadata not found.";
++			if (metadata.value("id").toString() == "cobblemon") return mod_browse_cobblemon(entries, readEntry);
++		} else {
++			QByteArray forgeData;
++			if (!readEntry("META-INF/mods.toml",262144,forgeData)) return "ERROR: Valid Fabric or Forge metadata not found.";
++			QList<ForgeModInfo> forgeMods=mod_forge_metadata(forgeData);
++			if (forgeMods.isEmpty() || forgeMods.first().id.isEmpty()) return "ERROR: Forge mod ID could not be read.";
++			for(const ForgeModInfo& mod:forgeMods) if(mod.id=="cobblemon") return mod_browse_cobblemon(entries, readEntry);
++		}
+ 		const QRegularExpression idPattern("^([a-z0-9_.-]+):([a-z0-9_./-]+)$");
+ 		auto resourcePath = [&idPattern](const QString& id, const QString& folder, const QString& suffix) -> QString {
+ 			if (id.size() > 240) return QString();
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index 03548bb..e6412b2 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -576,9 +576,9 @@
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
+ 		"modstitle": "Mods",
+-		"modsnotice": "Browse models in a Fabric JAR or import Bedrock geometry. Bone import is experimental; animations are not included.",
++		"modsnotice": "Inspect a Fabric or Forge JAR, then browse compatible models. Bone import is experimental; animations are not included.",
+ 		"modsbedrock": "Import Bedrock geometry...",
+-		"modsopen": "Inspect Fabric mod...",
++		"modsopen": "Inspect Fabric / Forge mod...",
+ 		"modschair": "Prepare acacia chair",
+ 		"modsmodel": "Find and preview a model...",
+ 		"model": "Model",
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index 4ebec2d..825fdc5 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -35,7 +35,7 @@ function bench_draw_settings(bx, by, bw, bh)
+ 		draw_tooltip_label("benchmodsnotice", icons.INFO, e_toast.INFO)
+ 		if (draw_button_label("benchmodsopen", dx, dy, dw, icons.BLOCK, e_button.SECONDARY))
+ 		{
+-			var mod_filename = file_dialog_open("Fabric mod (*.jar)|*.jar;", "", "", "Select Fabric mod")
++			var mod_filename = file_dialog_open("Minecraft mod (*.jar)|*.jar;", "", "", "Select Minecraft mod")
+ 			if (file_exists_lib(mod_filename))
+ 			{
+ 				bench_mods_path = mod_filename
+@@ -43,46 +43,10 @@ function bench_draw_settings(bx, by, bw, bh)
+ 			}
+ 		}
+ 		dy += 40
+-		if (draw_button_label("benchmodschair", dx, dy, dw, icons.MODEL, e_button.SECONDARY, null, e_anchor.LEFT, bench_mods_path = ""))
+-		{
+-			var prepared_chair = mod_export_demo_chair(bench_mods_path)
+-			if (string_pos("ERROR:", prepared_chair) = 1)
+-				bench_mods_info = prepared_chair
+-			else
+-			{
+-				bench_click(e_tl_type.MODEL)
+-				var chair_res = new_res(prepared_chair, e_res_type.MODEL)
+-				if (chair_res.replaced)
+-				{
+-					res_edit = chair_res
+-					action_res_replace(prepared_chair)
+-				}
+-				else
+-					with (chair_res)
+-						res_load()
+-				history_set_res(action_bench_model, prepared_chair, bench_settings.model, chair_res)
+-				with (bench_settings)
+-				{
+-					model = chair_res
+-					temp_update_model()
+-					temp_update_model_shape()
+-					with (preview)
+-					{
+-						preview_reset_view()
+-						update = true
+-					}
+-				}
+-				draw_set_alpha(prevalpha)
+-				return 0
+-			}
+-		}
+-		dy += 40
+ 		var prepared_model = ""
+ 		if (draw_button_label("benchmodsmodel", dx, dy, dw, icons.MODEL, e_button.SECONDARY, null, e_anchor.LEFT, bench_mods_path = ""))
+ 			prepared_model = mod_import_static_model(bench_mods_path, load_assets_zip_file)
+-		dy += 40
+-		if (draw_button_label("benchmodsbedrock", dx, dy, dw, icons.MODEL, e_button.SECONDARY))
+-			prepared_model = mod_import_bedrock_file()
++
+ 		if (prepared_model != "")
+ 		{
+ 			if (string_pos("ERROR:", prepared_model) = 1)

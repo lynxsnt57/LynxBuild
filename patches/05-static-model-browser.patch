@@ -1,0 +1,313 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 020d55a..9e314c8 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -1,7 +1,18 @@
+ #include "Generated/Scripts.hpp"
+ #include "World/GZIP.hpp"
++#include "AppHandler.hpp"
+ 
+ #include <QBuffer>
++#include <QDialog>
++#include <QDialogButtonBox>
++#include <QLabel>
++#include <QLineEdit>
++#include <QListWidget>
++#include <QVBoxLayout>
++#include <QSet>
++#include <QMap>
++#include <memory>
++#include <cmath>
+ #include <QDir>
+ #include <QFile>
+ #include <QFileInfo>
+@@ -229,6 +240,209 @@ namespace CppProject
+ 		return outputPath;
+ 	}
+ 
++	// Experimental static Minecraft block model importer. Reads data only, never mod code.
++	StringType mod_import_static_model(StringType jarPath)
++	{
++		int zipError = 0;
++		std::string archiveName = jarPath.ToStdString();
++		std::unique_ptr<zip_t, decltype(&zip_discard)> archive(zip_open(archiveName.c_str(), ZIP_RDONLY, &zipError), zip_discard);
++		if (!archive) return "ERROR: Cannot open the selected JAR.";
++		const zip_int64_t count = zip_get_num_entries(archive.get(), 0);
++		if (count < 0 || count > 100000) return "ERROR: Invalid or excessive number of archive entries.";
++		QMap<QString, zip_uint64_t> entries;
++		for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(count); ++i) {
++			const char* raw = zip_get_name(archive.get(), i, 0);
++			if (!raw) return "ERROR: Cannot read archive index.";
++			QString name = QString::fromUtf8(raw);
++			if (entries.contains(name)) return "ERROR: Duplicate archive entries are not supported.";
++			entries.insert(name, i);
++		}
++		auto readEntry = [&archive, &entries](const QString& name, zip_uint64_t limit, QByteArray& out) -> bool {
++			if (!entries.contains(name)) return false;
++			zip_uint64_t index = entries.value(name);
++			zip_stat_t st; zip_stat_init(&st);
++			if (zip_stat_index(archive.get(), index, 0, &st) != 0 || !(st.valid & ZIP_STAT_SIZE) || st.size > limit) return false;
++			zip_file_t* f = zip_fopen_index(archive.get(), index, 0);
++			if (!f) return false;
++			out.resize(static_cast<int>(st.size));
++			zip_uint64_t pos = 0;
++			while (pos < st.size) {
++				zip_int64_t n = zip_fread(f, out.data() + pos, st.size - pos);
++				if (n <= 0) { zip_fclose(f); return false; }
++				pos += static_cast<zip_uint64_t>(n);
++			}
++			return zip_fclose(f) == 0;
++		};
++		auto readJson = [&readEntry](const QString& path, QJsonObject& out) -> bool {
++			QByteArray bytes;
++			if (!readEntry(path, 1048576, bytes)) return false;
++			QJsonParseError error;
++			QJsonDocument doc = QJsonDocument::fromJson(bytes, &error);
++			if (error.error != QJsonParseError::NoError || !doc.isObject()) return false;
++			out = doc.object(); return true;
++		};
++		QJsonObject metadata;
++		if (!readJson("fabric.mod.json", metadata) || !metadata.value("id").isString()) return "ERROR: Valid Fabric metadata not found.";
++		const QRegularExpression idPattern("^([a-z0-9_.-]+):([a-z0-9_./-]+)$");
++		auto resourcePath = [&idPattern](const QString& id, const QString& folder, const QString& suffix) -> QString {
++			if (id.size() > 240) return QString();
++			QString full = id.contains(':') ? id : "minecraft:" + id;
++			auto match = idPattern.match(full);
++			if (!match.hasMatch()) return QString();
++			QString path = match.captured(2);
++			for (const QString& segment : path.split('/'))
++				if (segment.isEmpty() || segment == "." || segment == "..") return QString();
++			return "assets/" + match.captured(1) + "/" + folder + "/" + path + suffix;
++		};
++		QStringList models;
++		const QRegularExpression modelPattern("^assets/([a-z0-9_.-]+)/models/(block/[a-z0-9_./-]+)\\.json$");
++		for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
++			auto match = modelPattern.match(it.key());
++			if (match.hasMatch()) {
++				QString id = match.captured(1) + ":" + match.captured(2);
++				if (!resourcePath(id, "models", ".json").isEmpty()) models.append(id);
++			}
++		}
++		if (models.isEmpty()) return "ERROR: No block model JSON files found in this JAR.";
++		if (models.size() > 10000) return "ERROR: Too many models in this JAR.";
++		models.sort(Qt::CaseInsensitive);
++		QDialog dialog;
++		dialog.setWindowTitle("Select a static mod model");
++		dialog.resize(620, 550);
++		dialog.setStyleSheet(
++			"QDialog { background: #17191d; color: #e5e8ef; font-size: 13px; }"
++			"QLabel { color: #b8c1d0; padding: 5px; }"
++			"QLineEdit, QListWidget { background: #20242b; color: #f1f4f8; border: 1px solid #414954; border-radius: 4px; padding: 7px; }"
++			"QListWidget::item { padding: 5px; }"
++			"QListWidget::item:selected { background: #476da9; color: white; }"
++			"QPushButton { background: #344c72; color: white; border: 1px solid #6286bc; border-radius: 4px; padding: 7px 18px; }"
++			"QPushButton:hover { background: #486a9c; }");
++		QVBoxLayout layout(&dialog);
++		QLabel caption("Search model files. Some entries are parts, variants, or unsupported models.\nA 3D preview opens in the workbench after selection.");
++		caption.setWordWrap(true); layout.addWidget(&caption);
++		QLineEdit search; search.setPlaceholderText("Search models..."); layout.addWidget(&search);
++		QListWidget list; list.addItems(models); layout.addWidget(&list);
++		QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); layout.addWidget(&buttons);
++		list.setCurrentRow(0);
++		QObject::connect(&search, &QLineEdit::textChanged, &dialog, [&list](const QString& text) {
++			QListWidgetItem* first = nullptr;
++			for (int i = 0; i < list.count(); ++i) {
++				QListWidgetItem* item = list.item(i);
++				bool visible = item->text().contains(text, Qt::CaseInsensitive);
++				item->setHidden(!visible);
++				if (visible && !first) first = item;
++			}
++			list.setCurrentItem(first);
++		});
++		QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, [&dialog, &list]() {
++			if (list.currentItem() && !list.currentItem()->isHidden()) dialog.accept();
++		});
++		QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
++		QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, [&dialog](QListWidgetItem*) { dialog.accept(); });
++		if (App->ExecDialog(&dialog) != QDialog::Accepted) return "";
++		if (!list.currentItem()) return "";
++		QString selected = list.currentItem()->text();
++		QString current = selected;
++		QSet<QString> visited;
++		QList<QJsonObject> layers;
++		for (int depth = 0; ; ++depth) {
++			if (depth >= 32 || visited.contains(current)) return "ERROR: Model parent cycle or depth limit.";
++			visited.insert(current);
++			QString path = resourcePath(current, "models", ".json");
++			QJsonObject layer;
++			if (path.isEmpty() || !readJson(path, layer)) return "ERROR: Model parent missing from JAR or invalid (Minecraft/dependency assets are not supported yet).";
++			if (layer.contains("loader")) return "ERROR: This model uses a custom loader; not supported yet.";
++			layers.append(layer);
++			if (!layer.contains("parent")) break;
++			if (!layer.value("parent").isString()) return "ERROR: Invalid model parent.";
++			current = layer.value("parent").toString();
++		}
++		QJsonObject merged, textureRefs;
++		for (auto it = layers.crbegin(); it != layers.crend(); ++it) {
++			QJsonObject obj = *it;
++			if (obj.contains("textures") && !obj.value("textures").isObject()) return "ERROR: Unsupported texture map.";
++			QJsonObject textures = obj.value("textures").toObject();
++			for (auto t = textures.begin(); t != textures.end(); ++t) textureRefs.insert(t.key(), t.value());
++			for (auto p = obj.begin(); p != obj.end(); ++p)
++				if (p.key() != "parent" && p.key() != "textures") merged.insert(p.key(), p.value());
++		}
++		if (!merged.value("elements").isArray()) return "ERROR: This model has no static geometry.";
++		QJsonArray elements = merged.value("elements").toArray();
++		if (elements.isEmpty() || elements.size() > 1024) return "ERROR: Empty or excessively complex geometry.";
++		auto numbers = [](const QJsonValue& v, int n) -> bool {
++			if (!v.isArray()) return false;
++			QJsonArray a = v.toArray(); if (a.size() != n) return false;
++			for (const auto& x : a) if (!x.isDouble() || !std::isfinite(x.toDouble()) || std::abs(x.toDouble()) > 4096) return false;
++			return true;
++		};
++		QSet<QString> needed;
++		for (const QJsonValue& value : elements) {
++			if (!value.isObject()) return "ERROR: Invalid geometry element.";
++			QJsonObject element = value.toObject();
++			if (!numbers(element.value("from"), 3) || !numbers(element.value("to"), 3) || !element.value("faces").isObject()) return "ERROR: Unsupported geometry.";
++			// Restrict rotations in the first version; do not silently misrepresent them.
++			if (element.contains("rotation")) return "ERROR: Rotated geometry is not supported yet.";
++			if (element.contains("shade") && element.value("shade").isBool() && !element.value("shade").toBool()) return "ERROR: Unshaded elements are not supported yet.";
++			QJsonObject faces = element.value("faces").toObject();
++			if (faces.isEmpty()) return "ERROR: Empty model faces.";
++			for (auto f = faces.begin(); f != faces.end(); ++f) {
++				if (f.key() != "north" && f.key() != "south" && f.key() != "east" && f.key() != "west" && f.key() != "up" && f.key() != "down") return "ERROR: Unsupported face direction.";
++				if (!f.value().isObject()) return "ERROR: Invalid face.";
++				QJsonObject face = f.value().toObject();
++				if (!face.value("texture").isString() || !face.value("texture").toString().startsWith('#')) return "ERROR: Unsupported face texture reference.";
++				if (face.contains("uv")) {
++					if (!numbers(face.value("uv"), 4)) return "ERROR: Unsupported face UV.";
++					for (const QJsonValue& coord : face.value("uv").toArray())
++						if (coord.toDouble() < 0 || coord.toDouble() > 16) return "ERROR: Out-of-range UV is not supported yet.";
++				}
++				if (face.contains("tintindex")) return "ERROR: Tinted faces are not supported yet.";
++				if (face.contains("rotation") && (!face.value("rotation").isDouble() || (face.value("rotation").toDouble() != 0 && face.value("rotation").toDouble() != 90 && face.value("rotation").toDouble() != 180 && face.value("rotation").toDouble() != 270))) return "ERROR: Unsupported UV rotation.";
++				needed.insert(face.value("texture").toString().mid(1));
++			}
++		}
++		if (needed.size() > 32) return "ERROR: Too many textures.";
++		QJsonObject localTextures;
++		QMap<QString, QByteArray> images;
++		int imageNo = 0;
++		qint64 totalImageBytes = 0;
++		for (const QString& key : needed) {
++			QString ref = key; QSet<QString> seen;
++			while (true) {
++				if (seen.contains(ref) || !textureRefs.value(ref).isString()) return "ERROR: Unresolved or cyclic texture reference.";
++				seen.insert(ref);
++				QString value = textureRefs.value(ref).toString();
++				if (value.startsWith('#')) { ref = value.mid(1); continue; }
++				QString path = resourcePath(value, "textures", ".png"); QByteArray bytes;
++				if (path.isEmpty() || !readEntry(path, 8388608, bytes)) return "ERROR: Texture missing from JAR or too large (Minecraft/dependency assets are not supported yet).";
++				totalImageBytes += bytes.size();
++				if (totalImageBytes > 33554432) return "ERROR: Total textures are too large.";
++				// Reject animated and non-square atlases: the current block importer pads them.
++				if (entries.contains(path + ".mcmeta")) return "ERROR: Animated textures are not supported yet.";
++				QBuffer buffer(&bytes); if (!buffer.open(QIODevice::ReadOnly)) return "ERROR: Invalid texture.";
++				QImageReader reader(&buffer, "png"); QSize size = reader.size();
++				if (!size.isValid() || size.width() != size.height() || size.width() > 4096 || size.height() > 4096 || reader.read().isNull()) return "ERROR: Unsupported or invalid PNG texture (square textures only).";
++				QString local = QString("mod_texture_%1").arg(imageNo++);
++				images.insert(local + ".png", bytes); localTextures.insert(key, local);
++				break;
++			}
++		}
++		merged.insert("textures", localTextures);
++		QTemporaryDir temp(QDir::tempPath() + "/MineimatorModModel-XXXXXX");
++		if (!temp.isValid()) return "ERROR: Cannot create temporary model directory.";
++		auto write = [&temp](const QString& name, const QByteArray& data) -> bool {
++			QFile file(temp.filePath(name));
++			return file.open(QIODevice::WriteOnly | QIODevice::NewOnly) && file.write(data) == data.size() && file.flush();
++		};
++		for (auto it = images.cbegin(); it != images.cend(); ++it)
++			if (!write(it.key(), it.value())) return "ERROR: Cannot save temporary texture.";
++		QString shortName = selected.section('/', -1).left(80);
++		QString outputName = shortName + "-" + QFileInfo(temp.path()).fileName().right(6) + ".json";
++		if (!write(outputName, QJsonDocument(merged).toJson(QJsonDocument::Indented))) return "ERROR: Cannot save temporary model.";
++		QString outputPath = temp.filePath(outputName);
++		temp.setAutoRemove(false);
++		return outputPath;
++	}
++
+ 	RealType lib_unzip(StringType src, StringType dst)
+ 	{
+ 		int err;
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index 9ff56bf..bb0df13 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -576,9 +576,10 @@
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
+ 		"modstitle": "Mods",
+-		"modsnotice": "Inspect a Fabric mod JAR. Experimental import supports one static acacia chair from the Refurbished furniture mod.",
++		"modsnotice": "Inspect a Fabric mod JAR, then select a static block model. Some files are model parts or are not supported yet.",
+ 		"modsopen": "Inspect Fabric mod...",
+ 		"modschair": "Prepare acacia chair",
++		"modsmodel": "Find and preview a model...",
+ 		"model": "Model",
+ 		"skin": "Skin",
+ 		"skinmaterial": "Material map",
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index 2d1f82c..02e4a9c 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -77,6 +77,44 @@ function bench_draw_settings(bx, by, bw, bh)
+ 			}
+ 		}
+ 		dy += 40
++		if (draw_button_label("benchmodsmodel", dx, dy, dw, icons.MODEL, e_button.SECONDARY, null, e_anchor.LEFT, bench_mods_path = ""))
++		{
++			var prepared_model = mod_import_static_model(bench_mods_path)
++			if (prepared_model = "")
++			{
++				// Selection cancelled.
++			}
++			else if (string_pos("ERROR:", prepared_model) = 1)
++				bench_mods_info = prepared_model
++			else
++			{
++				bench_click(e_tl_type.MODEL)
++				var model_res = new_res(prepared_model, e_res_type.MODEL)
++				if (model_res.replaced)
++				{
++					res_edit = model_res
++					action_res_replace(prepared_model)
++				}
++				else
++					with (model_res)
++						res_load()
++				history_set_res(action_bench_model, prepared_model, bench_settings.model, model_res)
++				with (bench_settings)
++				{
++					model = model_res
++					temp_update_model()
++					temp_update_model_shape()
++					with (preview)
++					{
++						preview_reset_view()
++						update = true
++					}
++				}
++				draw_set_alpha(prevalpha)
++				return 0
++			}
++		}
++		dy += 40
+ 		if (bench_mods_info != "")
+ 		{
+ 			draw_set_font(font_caption)
+diff --git a/GmProject/scripts/util_cpp/util_cpp.gml b/GmProject/scripts/util_cpp/util_cpp.gml
+index 5a6aab7..777a662 100644
+--- a/GmProject/scripts/util_cpp/util_cpp.gml
++++ b/GmProject/scripts/util_cpp/util_cpp.gml
+@@ -431,3 +431,10 @@ function mod_export_demo_chair(filename)
+ {
+ 	return "ERROR: C++ build required."
+ }
++
++/// CppSeparate StringType mod_import_static_model(StringType)
++/// Select and prepare a supported static block model from a Fabric JAR.
++function mod_import_static_model(filename)
++{
++	return "ERROR: C++ build required."
++}

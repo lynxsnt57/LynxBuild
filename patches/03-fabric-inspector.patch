@@ -1,0 +1,157 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 8ab9b13..648badf 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -2,6 +2,9 @@
+ #include "World/GZIP.hpp"
+ 
+ #include <QDesktopServices>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QRegularExpression>
+ #include <QTextStream>
+ #include <QUrl>
+ 
+@@ -22,6 +25,74 @@ namespace CppProject
+ 		return 0.0;
+ 	}
+ 
++	// Inspect only the Fabric metadata entry, never extract files or run code.
++	StringType mod_inspect_fabric(StringType path)
++	{
++		int err = 0;
++		std::string archivePath = path.ToStdString();
++		zip_t* archive = zip_open(archivePath.c_str(), ZIP_RDONLY, &err);
++		if (!archive)
++			return "Cannot open the selected JAR.";
++		auto fail = [archive](const char* message) -> StringType {
++			zip_close(archive);
++			return message;
++		};
++		const zip_int64_t count = zip_get_num_entries(archive, 0);
++		if (count < 0 || count > 100000)
++			return fail("Archive has an invalid or excessive number of entries.");
++		zip_int64_t metadataIndex = -1;
++		int blocks = 0, models = 0, textures = 0;
++		for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(count); ++i)
++		{
++			const char* rawName = zip_get_name(archive, i, 0);
++			if (!rawName) return fail("Cannot read archive entries.");
++			QString name = QString::fromUtf8(rawName);
++			if (name == "fabric.mod.json") {
++				if (metadataIndex >= 0) return fail("Duplicate Fabric metadata entries.");
++				metadataIndex = static_cast<zip_int64_t>(i);
++			}
++			if (!name.startsWith("assets/") || name.endsWith('/')) continue;
++			if (name.contains("/blockstates/") && name.endsWith(".json")) ++blocks;
++			if (name.contains("/models/block/") && name.endsWith(".json")) ++models;
++			if (name.contains("/textures/") && name.endsWith(".png")) ++textures;
++		}
++		if (metadataIndex < 0) return fail("No fabric.mod.json found. Not a supported Fabric mod.");
++		zip_stat_t stat;
++		zip_stat_init(&stat);
++		if (zip_stat_index(archive, metadataIndex, 0, &stat) != 0 || !(stat.valid & ZIP_STAT_SIZE) || stat.size > 262144)
++			return fail("Fabric metadata is missing or too large.");
++		zip_file_t* file = zip_fopen_index(archive, metadataIndex, 0);
++		if (!file) return fail("Cannot open Fabric metadata.");
++		QByteArray data;
++		data.resize(static_cast<int>(stat.size));
++		zip_uint64_t pos = 0;
++		while (pos < stat.size) {
++			zip_int64_t n = zip_fread(file, data.data() + pos, stat.size - pos);
++			if (n <= 0) { zip_fclose(file); return fail("Cannot read Fabric metadata."); }
++			pos += static_cast<zip_uint64_t>(n);
++		}
++		if (zip_fclose(file) != 0) return fail("Invalid or corrupt Fabric metadata.");
++		zip_close(archive);
++		QJsonParseError parseError;
++		QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
++		if (parseError.error != QJsonParseError::NoError || !doc.isObject())
++			return "Fabric metadata is not valid JSON.";
++		QJsonObject meta = doc.object();
++		auto clean = [](QString text) -> QString {
++			text.replace(QRegularExpression("[\\x00-\\x1F\\x7F]"), " ");
++			text = text.trimmed().left(100);
++			return text.isEmpty() ? QString("Unknown") : text;
++		};
++		QString id = clean(meta.value("id").toString());
++		if (id == "Unknown") return "Fabric metadata has no mod ID.";
++		QString name = clean(meta.value("name").toString(id));
++		QString version = clean(meta.value("version").toString());
++		QString out = "Name: " + name + "\nID: " + id + "\nVersion: " + version;
++		out += QString("\nBlockstates: %1\nBlock model JSON files: %2\nTexture PNG files: %3").arg(blocks).arg(models).arg(textures);
++		out += "\nInspection only. No assets imported.";
++		return out;
++	}
++
+ 	RealType lib_unzip(StringType src, StringType dst)
+ 	{
+ 		int err;
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index a655d7b..f893501 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -576,7 +576,8 @@
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
+ 		"modstitle": "Mods",
+-		"modsnotice": "Mod support is not available yet. This panel is the starting point for a future importer.",
++		"modsnotice": "Inspect a Fabric mod JAR. Models and worlds cannot be imported yet.",
++		"modsopen": "Inspect Fabric mod...",
+ 		"model": "Model",
+ 		"skin": "Skin",
+ 		"skinmaterial": "Material map",
+diff --git a/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml b/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
+index d37f0c5..578dc8a 100644
+--- a/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
++++ b/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
+@@ -3,6 +3,7 @@
+ function app_startup_interface_bench()
+ {
+ 	bench_mods_selected = false
++	bench_mods_info = ""
+ 	bench_open = false
+ 	bench_hover_ani = 0
+ 	bench_hover_ani_goal = 0
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index 1cbd861..9d9fe0a 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -33,6 +33,20 @@ function bench_draw_settings(bx, by, bw, bh)
+ 		draw_label(text_get("benchmodstitle"), dx, dy, fa_left, fa_top, c_text_main, a_text_main, font_caption)
+ 		dy += 32
+ 		draw_tooltip_label("benchmodsnotice", icons.INFO, e_toast.INFO)
++		if (draw_button_label("benchmodsopen", dx, dy, dw, icons.BLOCK, e_button.SECONDARY))
++		{
++			var mod_filename = file_dialog_open("Fabric mod (*.jar)|*.jar;", "", "", "Select Fabric mod")
++			if (file_exists_lib(mod_filename))
++				bench_mods_info = mod_inspect_fabric(mod_filename)
++		}
++		dy += 40
++		if (bench_mods_info != "")
++		{
++			draw_set_font(font_caption)
++			var mod_info_wrapped = string_wrap(bench_mods_info, dw - 8)
++			draw_label(mod_info_wrapped, dx, dy, fa_left, fa_top, c_text_main, a_text_main, font_caption)
++			dy += 16 * (1 + string_count("\n", mod_info_wrapped))
++		}
+ 		draw_set_alpha(prevalpha)
+ 		return 0
+ 	}
+diff --git a/GmProject/scripts/util_cpp/util_cpp.gml b/GmProject/scripts/util_cpp/util_cpp.gml
+index 2a29c3b..ccf9f53 100644
+--- a/GmProject/scripts/util_cpp/util_cpp.gml
++++ b/GmProject/scripts/util_cpp/util_cpp.gml
+@@ -417,4 +417,10 @@ function clip_is_active()
+ /// CppSeparate void update_frustum()
+ function update_frustum()
+ {
+-}
+\ No newline at end of file
++}
++/// CppSeparate StringType mod_inspect_fabric(StringType)
++/// Inspect metadata without extracting files or executing the mod.
++function mod_inspect_fabric(filename)
++{
++	return "Fabric inspection is available in the C++ build only."
++}

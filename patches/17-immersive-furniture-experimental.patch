@@ -1,0 +1,552 @@
+diff --git a/CppProject/World/Chunk.cpp b/CppProject/World/Chunk.cpp
+index eb48e14..4b1ce94 100644
+--- a/CppProject/World/Chunk.cpp
++++ b/CppProject/World/Chunk.cpp
+@@ -157,6 +157,52 @@ namespace CppProject
+ 						worldPos = { posList[0]->value, posList[1]->value, posList[2]->value };
+ 					}
+ 
++					// Immersive Furniture stores the actual shape under a hash in the world.
++					// Swap only this position's palette index: palette entries are shared.
++					if (id == "immersive_furniture:furniture" && box.Contains(worldPos) &&
++						blockEntity->GetType("FurnitureHash") == TAG_STRING && format >= JAVA_1_18)
++					{
++						StringType hash = blockEntity->String("FurnitureHash");
++						StringType modelId = StringType("mineimator_immersive:") + hash;
++						obj_block* model = Builder::mcBlockIdObjMap.value(modelId, nullptr);
++						IntType sy = (worldPos.y >> 4), sectionIndex = sy - CHUNK_SECTION_MIN;
++						if (model && model->block_id > 0 && model->block_id <= 65535 && sectionIndex >= 0 && sectionIndex < CHUNK_SECTIONS && sections[sectionIndex] && sections[sectionIndex]->dataType == Section::BUILDER)
++						{
++							Section* section = sections[sectionIndex];
++							WorldVec rel = worldPos - box.start;
++							WorldVec builderPos = { rel.x, rel.z, rel.y };
++							IntType off = section->GetBlockOffset(builderPos);
++							if (off >= 0 && off < section->builder.sizeTotal && section->GetBuilderState(builderPos).blockId != 0)
++							{
++								StringType facing = "north", active = "false";
++								QVector<NbtCompound*> compounds = chunkRoot->List<TAG_COMPOUND, NbtCompound>("sections");
++								for (NbtCompound* sc : compounds)
++								{
++									if (sc->Byte("Y") != sy || !sc->HasKey("block_states")) continue;
++									NbtCompound* root = sc->Compound("block_states");
++									QVector<NbtCompound*> palette = root->List<TAG_COMPOUND, NbtCompound>("palette");
++									IntType idx = 0;
++									if (root->HasKey("data"))
++									{
++										Heap<uint16_t> indices; indices.Alloc(SECTION_SIZE3);
++										section->ParsePaletteIndices(root->LongArray("data"), indices, palette.size(), format, 4);
++										idx = indices.Value(((worldPos.y & 15) << 8) + ((worldPos.z & 15) << 4) + (worldPos.x & 15));
++									}
++									if (idx >= 0 && idx < palette.size() && palette[idx]->HasKey("Properties"))
++									{
++										NbtCompound* props = palette[idx]->Compound("Properties");
++										if (props->GetType("facing") == TAG_STRING) facing = props->String("facing");
++										if (props->GetType("active") == TAG_STRING) active = props->String("active");
++									}
++									break;
++								}
++								ArrType vars; vars[0] = "facing"; vars[1] = facing; vars[2] = "active"; vars[3] = active;
++								BuilderState state = { (uint16_t)model->block_id, (uint16_t)block_get_state_id(model->id, vars), section->GetBuilderState(builderPos).waterlogged };
++								section->builder.paletteIndices[off] = section->AddBuilderState(state);
++							}
++						}
++					}
++
+ 					// Get script
+ 					id = id.Replaced("minecraft:", "");
+ 					IntType scriptId = asset_get_index("block_tile_entity_" + id.ToLower());
+diff --git a/CppProject/World/FurnitureBake.cpp b/CppProject/World/FurnitureBake.cpp
+new file mode 100644
+index 0000000..4cee772
+--- /dev/null
++++ b/CppProject/World/FurnitureBake.cpp
+@@ -0,0 +1,69 @@
++#include "FurnitureBake.hpp"
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <stdexcept>
++#include <tuple>
++#include <utility>
++namespace ImmersiveFurniture {
++namespace {
++struct Shelf { int y,height,next; };
++struct Page { Atlas image; std::vector<Shelf> shelves; };
++struct Key {
++ int width,height; std::vector<std::uint32_t> pixels;
++ bool operator<(const Key& x) const {return std::tie(width,height,pixels)<std::tie(x.width,x.height,x.pixels);}
++};
++std::pair<int,int> dimensions(const Element& e,const std::string& face) {
++ int x=static_cast<int>(e.to[0]-e.from[0]);
++ int y=static_cast<int>(e.to[1]-e.from[1]);
++ int z=static_cast<int>(e.to[2]-e.from[2]);
++ if(face=="north"||face=="south")return {x,y};
++ if(face=="east"||face=="west")return {z,y};
++ return {x,z};
++}
++const TextureFace* findFace(const Element& e,const char* name,int state) {
++ const TextureFace* fallback=nullptr;
++ for(const auto& f:e.faces) if(f.direction==name) {if(f.state==state)return &f;if(f.state==0)fallback=&f;}
++ return fallback;
++}
++Rect place(const Key& key, std::vector<Page>& pages) {
++ int w=key.width+2,h=key.height+2;int page=-1,x=0,y=0;
++ for(std::size_t i=0;i<pages.size() && page<0;i++) {
++   auto& p=pages[i];
++   for(auto& shelf:p.shelves)if(h<=shelf.height && shelf.next+w<=AtlasSize){page=static_cast<int>(i);x=shelf.next;y=shelf.y;shelf.next+=w;break;}
++   if(page<0){int top=0;for(const auto& s:p.shelves)top+=s.height;if(top+h<=AtlasSize){page=static_cast<int>(i);x=0;y=top;p.shelves.push_back({top,h,w});}}
++ }
++ if(page<0){if(pages.size()>=512)throw std::runtime_error("furniture atlas page limit reached");page=static_cast<int>(pages.size());pages.emplace_back();pages.back().shelves.push_back({0,h,w});}
++ Atlas& dest=pages[page].image;
++ for(int j=-1;j<=key.height;j++)for(int i=-1;i<=key.width;i++){
++   int sx=std::max(0,std::min(key.width-1,i)),sy=std::max(0,std::min(key.height-1,j));
++   dest.pixels[(y+j+1)*AtlasSize+x+i+1]=key.pixels[sy*key.width+sx];
++ }
++ return {page,x+1,y+1,key.width,key.height};
++}
++}
++bool Bake(const Model& model,BakedModel& result,std::string& error){
++ try{
++  BakedModel temp;std::vector<Page> pages;std::map<Key,Rect> cache;
++  static const char* dirs[]={"north","south","east","west","up","down"};
++  for(int state=0;state<2;state++)for(const auto& elem:model.elements){
++   if((elem.mask&(1<<state))==0)continue;
++   if(elem.kind==Element::Kind::Other){temp.ignoredElements++;continue;}
++   BakedElement out;out.source=elem;out.source.faces.clear();
++   if(elem.kind==Element::Kind::Cube)for(const char* dir:dirs){
++    const auto* f=findFace(elem,dir,state);if(!f){temp.missingFaces++;continue;}
++    auto [w,h]=dimensions(elem,dir);
++    if(w<=0 || h<=0 || static_cast<std::size_t>(w)*h!=f->pixels.size())throw std::runtime_error("invalid baked face dimensions");
++    // Downsample only when the face cannot fit a single atlas slot.
++    int ow=std::min(w,AtlasSize-2),oh=std::min(h,AtlasSize-2);Key key{ow,oh,{}};key.pixels.reserve(ow*oh);
++    for(int y=0;y<oh;y++)for(int x=0;x<ow;x++)key.pixels.push_back(f->pixels[static_cast<std::size_t>(y)*h/oh*w+static_cast<std::size_t>(x)*w/ow]);
++    auto it=cache.find(key);if(it==cache.end()){Rect r=place(key,pages);it=cache.emplace(std::move(key),r).first;}
++    out.faces.push_back({dir,it->second});
++   }
++   if(elem.kind==Element::Kind::Sprite || !out.faces.empty())temp.states[state].push_back(std::move(out));
++  }
++  for(auto& page:pages)temp.atlases.push_back(std::move(page.image));
++  result=std::move(temp);error.clear();return true;
++ }catch(const std::exception& ex){error=ex.what();return false;}
++}
++}
+diff --git a/CppProject/World/FurnitureBake.hpp b/CppProject/World/FurnitureBake.hpp
+new file mode 100644
+index 0000000..6cf7eed
+--- /dev/null
++++ b/CppProject/World/FurnitureBake.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++#include "FurnitureData.hpp"
++#include <array>
++#include <string>
++#include <vector>
++
++namespace ImmersiveFurniture {
++constexpr int AtlasSize=128;
++struct Rect { int atlas=0,x=0,y=0,width=0,height=0; };
++struct Face { std::string direction; Rect rect; };
++struct BakedElement {
++  Element source;
++  std::vector<Face> faces;
++};
++struct Atlas { std::vector<std::uint32_t> pixels; Atlas():pixels(AtlasSize*AtlasSize,0){} };
++struct BakedModel { std::array<std::vector<BakedElement>,2> states; std::vector<Atlas> atlases; int missingFaces=0, ignoredElements=0; };
++// Makes stable fixed-size atlas pages; leaves 1px extruded margins to prevent bleeding.
++// Returns false without modifying result if model exceeds limits.
++bool Bake(const Model& model, BakedModel& result, std::string& error);
++}
+diff --git a/CppProject/World/FurnitureCache.cpp b/CppProject/World/FurnitureCache.cpp
+new file mode 100644
+index 0000000..7cbedc9
+--- /dev/null
++++ b/CppProject/World/FurnitureCache.cpp
+@@ -0,0 +1,101 @@
++#include "FurnitureCache.hpp"
++#include "FurnitureData.hpp"
++#include "FurnitureBake.hpp"
++#include <QDir>
++#include <QDateTime>
++#include <QFile>
++#include <QFileInfo>
++#include <QImage>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QRegularExpression>
++#include <algorithm>
++
++namespace CppProject {
++namespace {
++QStringList furnitureFiles(const QString& instance) {
++ QStringList out;
++ QDir saves(instance+"/saves");
++ for(const QFileInfo& world:saves.entryInfoList(QDir::Dirs|QDir::NoDotAndDotDot,QDir::Name)) {
++  QDir hashes(world.absoluteFilePath()+"/immersive_furniture/hash");
++  for(const QFileInfo& file:hashes.entryInfoList(QStringList()<<"*.nbt",QDir::Files|QDir::Readable,QDir::Name))
++   if(QRegularExpression("^[a-f0-9]{64}\\.nbt$").match(file.fileName()).hasMatch())out.append(file.absoluteFilePath());
++ }
++ return out;
++}
++bool writeJson(const QString& path,const QJsonObject& object) {
++ QDir().mkpath(QFileInfo(path).absolutePath());QFile file(path);
++ if (!file.open(QIODevice::WriteOnly|QIODevice::Truncate)) return false;
++ QByteArray json = QJsonDocument(object).toJson(QJsonDocument::Compact);
++ return file.write(json) == json.size();
++}
++QJsonArray point(const std::array<float,3>& p){return {p[0],p[1],p[2]};}
++QString textureName(const std::string& s){
++ QString t=QString::fromStdString(s).toLower();
++ if (!t.contains(':')) t="minecraft:"+t;
++ QStringList pieces=t.split(':');
++ if (pieces.size()!=2 || !QRegularExpression("^[a-z0-9_.-]+$").match(pieces[0]).hasMatch() ||
++     !QRegularExpression("^[a-z0-9_./-]+$").match(pieces[1]).hasMatch()) return {};
++ for (const QString& part:pieces[1].split('/')) if(part.isEmpty() || part=="." || part=="..") return {};
++ return pieces[0]=="minecraft" ? pieces[1] : t;
++}
++}
++QByteArray FurnitureSignature(const QString& instance) {
++ QByteArray sig;
++ for(const QString& filename:furnitureFiles(instance)) {QFileInfo f(filename);sig+=filename.toUtf8()+"|"+QByteArray::number(f.size())+"|"+QByteArray::number(f.lastModified().toMSecsSinceEpoch())+"\n";}
++ return sig;
++}
++void PrepareFurniture(const QString& instance,const QString& cache,QJsonArray& blocks,QSet<QString>& textures,QSet<QString>& sprites,QStringList& report) {
++ QSet<QString> seen;
++ for(const QString& path:furnitureFiles(instance)) {
++  QString hash=QFileInfo(path).baseName();if(seen.contains(hash))continue;seen.insert(hash);
++  QFile file(path);if(file.size()>16*1024*1024 || !file.open(QIODevice::ReadOnly)){report<<hash+": could not read";continue;}
++  QByteArray bytes=file.readAll();ImmersiveFurniture::Model model;ImmersiveFurniture::BakedModel baked;std::string error;
++  if(!ImmersiveFurniture::ReadGzip(bytes.constData(),bytes.size(),model,error) || !ImmersiveFurniture::Bake(model,baked,error)){report<<hash+": "+QString::fromStdString(error);continue;}
++  QString ns="mineimator_immersive", id=ns+":"+hash;
++  QString base=cache+"/assets/"+ns;
++  bool good=true;QStringList localTextures;
++  for(int i=0;i<(int)baked.atlases.size();i++){
++   const auto& src=baked.atlases[i];QImage image(128,128,QImage::Format_ARGB32);
++   for(int y=0;y<128;y++)for(int x=0;x<128;x++)image.setPixel(x,y,src.pixels[y*128+x]);
++   QString name="block/"+hash+"_"+QString::number(i), filename=base+"/textures/"+name+".png";
++   QDir().mkpath(QFileInfo(filename).absolutePath());if(!image.save(filename,"PNG")){good=false;break;}localTextures<<ns+":"+name;
++  }
++  if(!good){report<<hash+": cannot save atlas";continue;}
++  QSet<QString> localSprites;
++  for(int state=0;state<2 && good;state++) {
++   QJsonArray elements;QJsonObject textureMap;int n=0;
++   for(const auto& e:baked.states[state]) {
++    QJsonObject item,faceMap;item["from"]=point(e.source.from);item["to"]=point(e.source.to);
++    if(e.source.rotation!=0){QJsonArray origin;for(int j=0;j<3;j++)origin.append((e.source.from[j]+e.source.to[j])/2);QJsonObject rot;rot["origin"]=origin;rot["axis"]=QString(1, QChar(e.source.axis));rot["angle"]=e.source.rotation;item["rotation"]=rot;}
++    if(e.source.emission>0)item["light_emission"]=e.source.emission;
++    for(const auto& f:e.faces){QString key="t"+QString::number(f.rect.atlas);textureMap[key]=localTextures.value(f.rect.atlas);QJsonObject face;face["texture"]="#"+key;face["uv"]=QJsonArray{f.rect.x/8.0,f.rect.y/8.0,(f.rect.x+f.rect.width)/8.0,(f.rect.y+f.rect.height)/8.0};faceMap[QString::fromStdString(f.direction)]=face;}
++    if(e.source.kind==ImmersiveFurniture::Element::Kind::Sprite && !e.source.sprite.item && !e.source.sprite.tiled && e.source.sprite.size>0){
++     QString tex=textureName(e.source.sprite.texture);QString key="s"+QString::number(n);
++     if(tex.isEmpty()) { n++; continue; }
++     textureMap[key]=tex;localSprites.insert(tex);
++     float w=(e.source.to[0]-e.source.from[0])/e.source.sprite.size,h=(e.source.to[1]-e.source.from[1])/e.source.sprite.size;
++     for(int front=0;front<2;front++){bool reverse=bool(front)==e.source.sprite.mirrored;QJsonObject face;face["texture"]="#"+key;face["uv"]=QJsonArray{reverse?w:0.0,0.0,reverse?0.0:w,h};int angle=((e.source.sprite.rotation%360)+360)%360;face["rotation"]=front?angle:(360-angle)%360;
++      unsigned c=e.source.color; face["mineimator_color"]=int(((c>>16)&255) | (c&0xff00) | ((c&255)<<16));
++      faceMap[front?"north":"south"]=face;}
++    }
++    if(!faceMap.isEmpty()){item["faces"]=faceMap;elements.append(item);}n++;
++   }
++   QJsonObject json;json["textures"]=textureMap;json["elements"]=elements;
++   good=writeJson(base+"/models/block/"+hash+"_"+QString::number(state)+".json",json);
++  }
++  if(!good){report<<hash+": cannot save model";continue;}
++  QJsonObject variants;
++  const char* facing[]={"north","east","south","west"};const int rotations[]={0,90,180,270};
++  for(int state=0;state<2;state++)for(int i=0;i<4;i++){
++   QJsonObject v;v["model"]=ns+":block/"+hash+"_"+QString::number(state);v["y"]=rotations[i];
++   variants[QString("active=%1,facing=%2").arg(state?"true":"false",facing[i])]=v;
++  }
++  QJsonObject stateFile;stateFile["variants"]=variants;
++  if(!writeJson(base+"/blockstates/"+hash+".json",stateFile)){report<<hash+": cannot save blockstate";continue;}
++  QJsonObject entry,states;entry["name"]=id;entry["id"]=id;entry["file"]=id;states["active"]=QJsonArray{"false","true"};states["facing"]=QJsonArray{"north","east","south","west"};entry["states"]=states;blocks.append(entry);
++  for(const QString& t:localTextures)textures.insert(t);sprites.unite(localSprites);
++  report<<hash+": "+QString::fromStdString(model.name)+", missing baked faces: "+QString::number(baked.missingFaces)+", ignored elements: "+QString::number(baked.ignoredElements);
++ }
++}
++}
+diff --git a/CppProject/World/FurnitureCache.hpp b/CppProject/World/FurnitureCache.hpp
+new file mode 100644
+index 0000000..e7ab2ac
+--- /dev/null
++++ b/CppProject/World/FurnitureCache.hpp
+@@ -0,0 +1,13 @@
++#pragma once
++#include <QByteArray>
++#include <QJsonArray>
++#include <QSet>
++#include <QStringList>
++
++namespace CppProject {
++// Fingerprints furniture definitions from instance saves so the mod cache is rebuilt.
++QByteArray FurnitureSignature(const QString& instance);
++// Produce model JSON and texture pages from saved furniture definitions.
++void PrepareFurniture(const QString& instance,const QString& cache,QJsonArray& blocks,
++                      QSet<QString>& textures,QSet<QString>& spriteTextures,QStringList& report);
++}
+diff --git a/CppProject/World/FurnitureData.cpp b/CppProject/World/FurnitureData.cpp
+new file mode 100644
+index 0000000..f6432d0
+--- /dev/null
++++ b/CppProject/World/FurnitureData.cpp
+@@ -0,0 +1,112 @@
++#include "FurnitureData.hpp"
++#include <zlib.h>
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <stdexcept>
++#include <utility>
++
++namespace ImmersiveFurniture {
++namespace {
++constexpr std::size_t MAX_IN=16u*1024*1024, MAX_OUT=64u*1024*1024, MAX_ITEMS=1000000, MAX_DEPTH=64;
++struct Tag {
++    int type=0; double num=0; std::string str;
++    std::vector<std::int32_t> ints;
++    std::vector<Tag> list;
++    std::map<std::string,Tag> children;
++    const Tag* field(const char* k,int t) const {
++        auto it=children.find(k);
++        return it!=children.end() && it->second.type==t ? &it->second : nullptr;
++    }
++};
++struct Reader {
++    const std::vector<unsigned char>& bytes; std::size_t pos=0, items=0;
++    [[noreturn]] void bad(const char* e) { throw std::runtime_error(e); }
++    void require(std::size_t n) { if(n>bytes.size()-pos) bad("truncated NBT"); }
++    std::uint64_t number(int n) { require(n); std::uint64_t v=0; while(n--)v=(v<<8)|bytes[pos++]; return v; }
++    std::string text() { auto n=number(2); require(n); std::string out(reinterpret_cast<const char*>(&bytes[pos]),static_cast<std::size_t>(n));pos+=n;return out; }
++    std::size_t count() { auto raw=number(4); if(raw>MAX_ITEMS || items+raw>MAX_ITEMS)bad("too many NBT items");items+=static_cast<std::size_t>(raw);return static_cast<std::size_t>(raw); }
++    Tag read(int type,std::size_t depth) {
++        if(depth>MAX_DEPTH || ++items>MAX_ITEMS)bad("NBT nesting or item limit exceeded");
++        Tag out;out.type=type;
++        switch(type) {
++        case 1: out.num=static_cast<std::int8_t>(number(1));break;
++        case 2: out.num=static_cast<std::int16_t>(number(2));break;
++        case 3: out.num=static_cast<std::int32_t>(number(4));break;
++        case 4: out.num=static_cast<double>(static_cast<std::int64_t>(number(8)));break;
++        case 5: { std::uint32_t b=static_cast<std::uint32_t>(number(4));float f;std::memcpy(&f,&b,4);out.num=f;break; }
++        case 6: { std::uint64_t b=number(8);double d;std::memcpy(&d,&b,8);out.num=d;break; }
++        case 7: { auto n=count();require(n);pos+=n;break; }
++        case 8: out.str=text();break;
++        case 9: {
++            int elem=static_cast<int>(number(1)); auto n=count();
++            if((elem<1 || elem>12) && !(elem==0 && n==0))bad("invalid NBT list type");
++            out.list.reserve(n);for(std::size_t i=0;i<n;++i)out.list.push_back(read(elem,depth+1));break;
++        }
++        case 10: {
++            while(true){int t=static_cast<int>(number(1));if(!t)break;if(t>12)bad("invalid NBT type");std::string key=text();
++                Tag val=read(t,depth+1);if(!out.children.emplace(std::move(key),std::move(val)).second)bad("duplicate NBT key");}break;
++        }
++        case 11: {auto n=count();if(n>(bytes.size()-pos)/4)bad("truncated int array");out.ints.reserve(n);for(std::size_t i=0;i<n;++i)out.ints.push_back(static_cast<std::int32_t>(number(4)));break;}
++        case 12: {auto n=count();if(n>(bytes.size()-pos)/8)bad("truncated long array");pos+=n*8;break;}
++        default:bad("invalid NBT type");
++        }
++        return out;
++    }
++};
++std::vector<unsigned char> inflateBounded(const void* data,std::size_t size) {
++    if(!data || !size || size>MAX_IN)throw std::runtime_error("invalid or oversized gzip");
++    z_stream z{};z.next_in=const_cast<Bytef*>(static_cast<const Bytef*>(data));z.avail_in=static_cast<uInt>(size);
++    if(inflateInit2(&z,15+32)!=Z_OK)throw std::runtime_error("cannot initialise gzip");
++    std::vector<unsigned char> out;unsigned char buf[16384];int status=Z_OK;
++    while(status==Z_OK){z.next_out=buf;z.avail_out=sizeof(buf);status=inflate(&z,Z_NO_FLUSH);
++      auto n=sizeof(buf)-z.avail_out;if(n>MAX_OUT-out.size()){inflateEnd(&z);throw std::runtime_error("decompressed data too large");}
++      out.insert(out.end(),buf,buf+n);
++    }
++    inflateEnd(&z);if(status!=Z_STREAM_END)throw std::runtime_error("invalid or truncated gzip");return out;
++}
++int integer(const Tag& t,const char* k,int def){auto p=t.field(k,3);return p?static_cast<int>(p->num):def;}
++float number(const Tag& t,const char* k,float def){auto p=t.field(k,5);return p?static_cast<float>(p->num):def;}
++std::string string(const Tag& t,const char* k,const char* def=""){auto p=t.field(k,8);return p?p->str:def;}
++bool boolean(const Tag& t,const char* k){auto p=t.field(k,1);return p && p->num!=0;}
++std::array<float,3> vector3(const Tag& t,const char* k){
++    auto p=t.field(k,9);if(!p || p->list.size()!=3)throw std::runtime_error("invalid element coordinates");
++    std::array<float,3> out;for(int i=0;i<3;i++){
++      if(p->list[i].type!=5 || !std::isfinite(p->list[i].num) || std::abs(p->list[i].num)>16384)throw std::runtime_error("invalid element coordinate");
++      out[i]=static_cast<float>(p->list[i].num);
++    }return out;
++}
++void faces(const Tag* map, int defaultState, Element& e) {
++ if(!map)return;
++ for(const auto& kv:map->children){if(kv.second.type!=11)continue;
++  auto sep=kv.first.find(':');std::string dir=kv.first.substr(0,sep);int state=defaultState;
++  if(dir!="north" && dir!="south" && dir!="east" && dir!="west" && dir!="up" && dir!="down")continue;
++  if(sep!=std::string::npos){auto tail=kv.first.substr(sep+1);if(tail!="0" && tail!="1")continue;state=tail=="1"?1:0;}
++  TextureFace face;face.direction=dir;face.state=state;face.pixels.reserve(kv.second.ints.size());
++  for(auto n:kv.second.ints) face.pixels.push_back(static_cast<std::uint32_t>(n));
++  e.faces.push_back(std::move(face));
++ }
++}
++Model decode(const Tag& root) {
++ if(root.type!=10)throw std::runtime_error("NBT root is not a compound");
++ Model m;m.name=string(root,"Name");m.size={{integer(root,"SizeX",1),integer(root,"SizeY",1),integer(root,"SizeZ",1)}};
++ auto list=root.field("Elements",9);if(!list || list->list.size()>8192)throw std::runtime_error("invalid element list");
++ for(const Tag& t:list->list){if(t.type!=10)throw std::runtime_error("invalid element");
++   Element e;auto type=string(t,"Type");e.kind=type=="element"?Element::Kind::Cube:type=="sprite"?Element::Kind::Sprite:Element::Kind::Other;
++   e.from=vector3(t,"From");e.to=vector3(t,"To");e.rotation=number(t,"Rotation",0);auto axis=string(t,"Axis","y");
++   if(!std::isfinite(e.rotation) || (axis!="x" && axis!="y" && axis!="z"))throw std::runtime_error("invalid rotation");
++   e.axis=axis[0];e.mask=integer(t,"Mask",3);e.emission=integer(t,"Emission",0);e.color=static_cast<std::uint32_t>(integer(t,"Color",-1));
++   if(auto material=t.field("Material",10))e.transparency=string(*material,"Transparency","SOLID");
++   if(auto s=t.field("Sprite",10)){e.sprite.texture=string(*s,"Sprite");e.sprite.size=number(*s,"Size",1);e.sprite.rotation=integer(*s,"Rotation",0);e.sprite.tiled=boolean(*s,"Tiled");e.sprite.item=boolean(*s,"Item");e.sprite.mirrored=boolean(*s,"Mirrored");}
++   faces(t.field("BakedTexture",10),0,e);faces(t.field("BakedTextures",10),0,e);m.elements.push_back(std::move(e));
++ }
++ return m;
++}
++}
++bool ReadGzip(const void* data,std::size_t size,Model& result,std::string& error){
++ try{auto bytes=inflateBounded(data,size);Reader r{bytes};if(r.number(1)!=10)throw std::runtime_error("invalid root");r.text();auto root=r.read(10,0);if(r.pos!=bytes.size())throw std::runtime_error("extra NBT data");Model parsed=decode(root);result=std::move(parsed);error.clear();return true;}
++ catch(const std::exception& ex){error=ex.what();return false;}
++}
++}
+diff --git a/CppProject/World/FurnitureData.hpp b/CppProject/World/FurnitureData.hpp
+new file mode 100644
+index 0000000..d8c729c
+--- /dev/null
++++ b/CppProject/World/FurnitureData.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// Reader for the saved data format, independent of Qt and the world importer.
++namespace ImmersiveFurniture {
++struct TextureFace { std::string direction; int state = 0; std::vector<std::uint32_t> pixels; };
++struct Sprite { std::string texture; float size=1; int rotation=0; bool tiled=false, item=false, mirrored=false; };
++struct Element {
++    enum class Kind { Cube, Sprite, Other } kind=Kind::Other;
++    std::array<float,3> from{}, to{};
++    float rotation=0;
++    char axis='y';
++    int mask=3, emission=0;
++    std::uint32_t color=0xffffffffu;
++    std::string transparency;
++    Sprite sprite;
++    std::vector<TextureFace> faces;
++};
++struct Model { std::string name; std::array<int,3> size{{1,1,1}}; std::vector<Element> elements; };
++// Returns false on unsupported, malformed, oversized or truncated input. Error is printable.
++bool ReadGzip(const void* data, std::size_t size, Model& result, std::string& error);
++}
+diff --git a/CppProject/World/ModAssets.cpp b/CppProject/World/ModAssets.cpp
+index e6a1143..d1e6d8d 100644
+--- a/CppProject/World/ModAssets.cpp
++++ b/CppProject/World/ModAssets.cpp
+@@ -12,6 +12,7 @@
+ // executed; only JSON and PNG files are parsed.
+ 
+ #include "Generated/Scripts.hpp"
++#include "FurnitureCache.hpp"
+ 
+ // The project links libzip statically (as in Library/FileLib.cpp).
+ #define ZIP_STATIC
+@@ -34,7 +35,7 @@
+ 
+ #include <functional>
+ 
+-#define MODWORLD_CACHE_FORMAT 2
++#define MODWORLD_CACHE_FORMAT 3
+ #define MODWORLD_MAX_JSON_SIZE (4 * 1024 * 1024)
+ #define MODWORLD_MAX_PNG_SIZE (16 * 1024 * 1024)
+ #define MODWORLD_MAX_NESTED_JAR_SIZE (64 * 1024 * 1024)
+@@ -398,6 +399,7 @@ namespace CppProject
+ 		for (const QFileInfo& jar : jars)
+ 			signature += jar.fileName().toUtf8() + "|" + QByteArray::number(jar.size()) + "|" +
+ 				QByteArray::number(jar.lastModified().toMSecsSinceEpoch()) + "\n";
++		signature += FurnitureSignature(instancePath);
+ 		const QByteArray signatureHash = QCryptographicHash::hash(signature, QCryptographicHash::Sha1).toHex();
+ 
+ 		{
+@@ -722,6 +724,12 @@ namespace CppProject
+ 			for (const QString& m : block.models)
+ 				tintForModel(m);
+ 
++		QJsonArray furnitureBlocks;
++		QSet<QString> furnitureTextures, furnitureSprites;
++		QStringList furnitureReport;
++		PrepareFurniture(instancePath, cachePath, furnitureBlocks, furnitureTextures, furnitureSprites, furnitureReport);
++		usedTextures.unite(furnitureSprites);
++
+ 		// Pass 2: extract and normalize the used mod textures
+ 		QHash<int, QStringList> texturesByArchive;
+ 		QStringList missingTextures;
+@@ -737,8 +745,8 @@ namespace CppProject
+ 			texturesByArchive[textureRefs[name].archive].append(name);
+ 		}
+ 
+-		QSet<QString> writtenTextures;
+-		int maxTextureSize = MODWORLD_TEXTURE_SIZE;
++		QSet<QString> writtenTextures = furnitureTextures;
++		int maxTextureSize = furnitureTextures.isEmpty() ? MODWORLD_TEXTURE_SIZE : MODWORLD_TEXTURE_MAX_SIZE;
+ 		for (auto it = texturesByArchive.begin(); it != texturesByArchive.end(); ++it)
+ 		{
+ 			QByteArray holder;
+@@ -784,7 +792,7 @@ namespace CppProject
+ 		for (auto it = parsedModels.begin(); it != parsedModels.end(); ++it)
+ 			WriteFile(pathFor(it.key(), "models"), QJsonDocument(it.value()).toJson(QJsonDocument::Compact));
+ 
+-		QJsonArray blockArray;
++		QJsonArray blockArray = furnitureBlocks;
+ 		for (const ModBlock& block : blocks)
+ 		{
+ 			if (!WriteFile(pathFor(block.id, "blockstates"), QJsonDocument(block.json).toJson(QJsonDocument::Compact)))
+@@ -873,6 +881,7 @@ namespace CppProject
+ 			if (list.size() > 2000)
+ 				report << "  ... " + QString::number(list.size() - 2000) + " more";
+ 		};
++		section("Immersive Furniture", furnitureReport);
+ 		section("Archive errors", archiveErrors);
+ 		section("Skipped blocks", skippedBlocks);
+ 		section("Missing models", QStringList(missingModels.values()));
+diff --git a/GmProject/scripts/block_load_model_file/block_load_model_file.gml b/GmProject/scripts/block_load_model_file/block_load_model_file.gml
+index de0bdd5..c9ca3b3 100644
+--- a/GmProject/scripts/block_load_model_file/block_load_model_file.gml
++++ b/GmProject/scripts/block_load_model_file/block_load_model_file.gml
+@@ -191,6 +191,11 @@ function block_load_model_file(fname, res = null)
+ 							// Texture
+ 							face_texture[f] = curmap[?"texture"]
+ 							
++							// Optional tint for imported furniture sprites
++							face_custom_color[f] = -1
++							if (is_real(curmap[?"mineimator_color"]))
++								face_custom_color[f] = curmap[?"mineimator_color"]
++
+ 							// Rotation
+ 							face_rotation[f] = 0
+ 							if (is_real(curmap[?"rotation"]))
+diff --git a/GmProject/scripts/block_load_render_model/block_load_render_model.gml b/GmProject/scripts/block_load_render_model/block_load_render_model.gml
+index 2221e5a..23c7c6f 100644
+--- a/GmProject/scripts/block_load_render_model/block_load_render_model.gml
++++ b/GmProject/scripts/block_load_render_model/block_load_render_model.gml
+@@ -375,7 +375,7 @@ function block_load_render_model(model, rot, uvlock, opaque, wei, res = null)
+ 						}
+ 						
+ 						// Texture color
+-						face_texture_color[nd] = -1
++						face_texture_color[nd] = elem.face_custom_color[f]
+ 						
+ 						// Check texture with resource
+ 						if (res != null && res.model_texture_map != null && !is_undefined(res.model_texture_map[?texname]))
+diff --git a/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml b/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
+index 9d9f664..9de2bad 100644
+--- a/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
++++ b/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
+@@ -403,6 +403,14 @@ function res_load_pack_block_sheet(type, suffix)
+ 				continue
+ 			}
+ 		
++			// Furniture pages contain several different faces, so sparse alpha samples
++			// cannot determine whether one of them is translucent.
++			if (string_pos("mineimator_immersive:block/", mc_assets.block_texture_list[|t]) = 1)
++			{
++				ds_list_add(block_sheet_depth_list, e_block_depth.DEPTH2)
++				continue
++			}
++
+ 			// Leaves are always treated as transparent (opaque or not) to fix wind issues
+ 			var opaque = string_contains(mc_assets.block_texture_list[|t], "leaves");
+ 			if (opaque)

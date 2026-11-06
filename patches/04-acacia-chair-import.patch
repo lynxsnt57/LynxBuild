@@ -1,0 +1,246 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 648badf..020d55a 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -1,7 +1,15 @@
+ #include "Generated/Scripts.hpp"
+ #include "World/GZIP.hpp"
+ 
++#include <QBuffer>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
+ #include <QDesktopServices>
++#include <QImageReader>
++#include <QJsonArray>
++#include <QTemporaryDir>
++#include <cstring>
+ #include <QJsonDocument>
+ #include <QJsonObject>
+ #include <QRegularExpression>
+@@ -93,6 +101,134 @@ namespace CppProject
+ 		return out;
+ 	}
+ 
++	// Prepare exactly the static acacia chair from Refurbished, without running code.
++	// This is deliberately not a generic mod importer or a skeletal animation converter.
++	StringType mod_export_demo_chair(StringType jarPath)
++	{
++		int errorCode = 0;
++		std::string jarName = jarPath.ToStdString();
++		zip_t* archive = zip_open(jarName.c_str(), ZIP_RDONLY, &errorCode);
++		if (!archive) return "ERROR: Cannot open the mod JAR.";
++		auto fail = [archive](const char* message) -> StringType {
++			zip_close(archive);
++			return message;
++		};
++		const zip_int64_t count = zip_get_num_entries(archive, 0);
++		if (count < 0 || count > 100000)
++			return fail("ERROR: Invalid or excessively large archive.");
++		// Match exact entry names and reject ambiguous duplicates; never extract paths.
++		auto readEntry = [archive, count](const char* name, zip_uint64_t maxSize, QByteArray& out) -> bool {
++			zip_int64_t found = -1;
++			for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(count); ++i) {
++				const char* entry = zip_get_name(archive, i, 0);
++				if (!entry) return false;
++				if (std::strcmp(entry, name) == 0) {
++					if (found >= 0) return false;
++					found = static_cast<zip_int64_t>(i);
++				}
++			}
++			if (found < 0) return false;
++			zip_stat_t st;
++			zip_stat_init(&st);
++			if (zip_stat_index(archive, found, 0, &st) != 0 || !(st.valid & ZIP_STAT_SIZE) || st.size > maxSize) return false;
++			zip_file_t* f = zip_fopen_index(archive, found, 0);
++			if (!f) return false;
++			out.resize(static_cast<int>(st.size));
++			zip_uint64_t pos = 0;
++			while (pos < st.size) {
++				zip_int64_t n = zip_fread(f, out.data() + pos, st.size - pos);
++				if (n <= 0) { zip_fclose(f); return false; }
++				pos += static_cast<zip_uint64_t>(n);
++			}
++			return zip_fclose(f) == 0;
++		};
++		QByteArray metaBytes, childBytes, parentBytes, textureBytes, particleBytes;
++		if (!readEntry("fabric.mod.json", 262144, metaBytes) ||
++			!readEntry("assets/refurbished_furniture/models/block/acacia_chair.json", 1048576, childBytes) ||
++			!readEntry("assets/refurbished_furniture/models/block/chair.json", 1048576, parentBytes) ||
++			!readEntry("assets/refurbished_furniture/textures/block/acacia_chair.png", 8388608, textureBytes) ||
++			!readEntry("assets/refurbished_furniture/textures/block/acacia_particle.png", 8388608, particleBytes))
++			return fail("ERROR: Required chair files are missing, invalid, duplicated, or too large.");
++		zip_close(archive);
++		QJsonParseError jsonError;
++		auto readObject = [&jsonError](const QByteArray& bytes, QJsonObject& object) -> bool {
++			QJsonDocument doc = QJsonDocument::fromJson(bytes, &jsonError);
++			if (jsonError.error != QJsonParseError::NoError || !doc.isObject()) return false;
++			object = doc.object();
++			return true;
++		};
++		QJsonObject meta, child, parent;
++		if (!readObject(metaBytes, meta) || !readObject(childBytes, child) || !readObject(parentBytes, parent))
++			return "ERROR: Chair model JSON is invalid.";
++		if (meta.value("id").toString() != "refurbished_furniture" ||
++			child.value("parent").toString() != "refurbished_furniture:block/chair" ||
++			child.contains("elements") || child.contains("loader") || parent.contains("loader") || parent.contains("parent"))
++			return "ERROR: Unsupported mod or chair model version.";
++		QJsonObject textures = child.value("textures").toObject();
++		if (textures.value("texture").toString() != "refurbished_furniture:block/acacia_chair" ||
++			textures.value("particle").toString() != "refurbished_furniture:block/acacia_particle" ||
++			!parent.value("elements").isArray() || parent.value("elements").toArray().size() != 6)
++			return "ERROR: This chair layout is not supported.";
++		// Reject unsupported geometry rather than silently importing it incorrectly.
++		auto numericArray = [](const QJsonValue& value, int n) -> bool {
++			if (!value.isArray()) return false;
++			QJsonArray arr = value.toArray();
++			if (arr.size() != n) return false;
++			for (const QJsonValue& item : arr) if (!item.isDouble()) return false;
++			return true;
++		};
++		for (const QJsonValue& item : parent.value("elements").toArray()) {
++			if (!item.isObject()) return "ERROR: Unsupported chair geometry.";
++			QJsonObject element = item.toObject();
++			if (!numericArray(element.value("from"), 3) || !numericArray(element.value("to"), 3) ||
++				!element.value("faces").isObject() || element.contains("rotation"))
++				return "ERROR: Unsupported chair geometry.";
++			QJsonObject faces = element.value("faces").toObject();
++			for (auto it = faces.begin(); it != faces.end(); ++it) {
++				if (it.key() != "north" && it.key() != "south" && it.key() != "east" &&
++					it.key() != "west" && it.key() != "up" && it.key() != "down")
++					return "ERROR: Unsupported chair face.";
++				if (!it.value().isObject()) return "ERROR: Invalid chair face.";
++				QJsonObject face = it.value().toObject();
++				if (face.value("texture").toString() != "#texture" || !numericArray(face.value("uv"), 4) || face.contains("rotation"))
++					return "ERROR: Unsupported chair UV or texture.";
++			}
++		}
++		auto validPng = [](const QByteArray& bytes) -> bool {
++			QBuffer buffer;
++			buffer.setData(bytes);
++			if (!buffer.open(QIODevice::ReadOnly)) return false;
++			QImageReader reader(&buffer, "png");
++			QSize size = reader.size();
++			if (!size.isValid() || size.width() > 4096 || size.height() > 4096 ||
++				static_cast<qint64>(size.width()) * size.height() > 16777216) return false;
++			return !reader.read().isNull();
++		};
++		if (!validPng(textureBytes) || !validPng(particleBytes))
++			return "ERROR: Chair texture is invalid or too large.";
++		// Flatten known inheritance for Mine-imator's standalone JSON block loader.
++		QJsonObject model = parent;
++		QJsonObject localTextures;
++		localTextures.insert("texture", "chair_texture");
++		localTextures.insert("particle", "chair_particle");
++		model.insert("textures", localTextures);
++		QTemporaryDir temp(QDir::tempPath() + "/MineimatorModChair-XXXXXX");
++		if (!temp.isValid()) return "ERROR: Cannot create temporary chair directory.";
++		auto write = [&temp](const QString& name, const QByteArray& data) -> bool {
++			QFile file(temp.filePath(name));
++			if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly)) return false;
++			if (file.write(data) != data.size()) return false;
++			return file.flush();
++		};
++		QString outputName = QFileInfo(temp.path()).fileName() + ".json";
++		if (!write("chair_texture.png", textureBytes) || !write("chair_particle.png", particleBytes) ||
++			!write(outputName, QJsonDocument(model).toJson(QJsonDocument::Indented)))
++			return "ERROR: Cannot save temporary chair files.";
++		QString outputPath = temp.filePath(outputName);
++		temp.setAutoRemove(false); // Kept while the project resource is imported and saved.
++		return outputPath;
++	}
++
+ 	RealType lib_unzip(StringType src, StringType dst)
+ 	{
+ 		int err;
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index f893501..9ff56bf 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -576,8 +576,9 @@
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
+ 		"modstitle": "Mods",
+-		"modsnotice": "Inspect a Fabric mod JAR. Models and worlds cannot be imported yet.",
++		"modsnotice": "Inspect a Fabric mod JAR. Experimental import supports one static acacia chair from the Refurbished furniture mod.",
+ 		"modsopen": "Inspect Fabric mod...",
++		"modschair": "Prepare acacia chair",
+ 		"model": "Model",
+ 		"skin": "Skin",
+ 		"skinmaterial": "Material map",
+diff --git a/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml b/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
+index 578dc8a..ad09516 100644
+--- a/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
++++ b/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
+@@ -4,6 +4,7 @@ function app_startup_interface_bench()
+ {
+ 	bench_mods_selected = false
+ 	bench_mods_info = ""
++	bench_mods_path = ""
+ 	bench_open = false
+ 	bench_hover_ani = 0
+ 	bench_hover_ani_goal = 0
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index 9d9fe0a..2d1f82c 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -37,7 +37,44 @@ function bench_draw_settings(bx, by, bw, bh)
+ 		{
+ 			var mod_filename = file_dialog_open("Fabric mod (*.jar)|*.jar;", "", "", "Select Fabric mod")
+ 			if (file_exists_lib(mod_filename))
++			{
++				bench_mods_path = mod_filename
+ 				bench_mods_info = mod_inspect_fabric(mod_filename)
++			}
++		}
++		dy += 40
++		if (draw_button_label("benchmodschair", dx, dy, dw, icons.MODEL, e_button.SECONDARY, null, e_anchor.LEFT, bench_mods_path = ""))
++		{
++			var prepared_chair = mod_export_demo_chair(bench_mods_path)
++			if (string_pos("ERROR:", prepared_chair) = 1)
++				bench_mods_info = prepared_chair
++			else
++			{
++				bench_click(e_tl_type.MODEL)
++				var chair_res = new_res(prepared_chair, e_res_type.MODEL)
++				if (chair_res.replaced)
++				{
++					res_edit = chair_res
++					action_res_replace(prepared_chair)
++				}
++				else
++					with (chair_res)
++						res_load()
++				history_set_res(action_bench_model, prepared_chair, bench_settings.model, chair_res)
++				with (bench_settings)
++				{
++					model = chair_res
++					temp_update_model()
++					temp_update_model_shape()
++					with (preview)
++					{
++						preview_reset_view()
++						update = true
++					}
++				}
++				draw_set_alpha(prevalpha)
++				return 0
++			}
+ 		}
+ 		dy += 40
+ 		if (bench_mods_info != "")
+diff --git a/GmProject/scripts/util_cpp/util_cpp.gml b/GmProject/scripts/util_cpp/util_cpp.gml
+index ccf9f53..5a6aab7 100644
+--- a/GmProject/scripts/util_cpp/util_cpp.gml
++++ b/GmProject/scripts/util_cpp/util_cpp.gml
+@@ -424,3 +424,10 @@ function mod_inspect_fabric(filename)
+ {
+ 	return "Fabric inspection is available in the C++ build only."
+ }
++
++/// CppSeparate StringType mod_export_demo_chair(StringType)
++/// Prepare one supported chair model and its textures without executing mod code.
++function mod_export_demo_chair(filename)
++{
++	return "ERROR: C++ build required."
++}

@@ -1,0 +1,106 @@
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index 72afab3..a655d7b 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -554,6 +554,7 @@
+ 		"spotlight": "Spot light",
+ 		"camera": "Camera",
+ 		"background": "Environment",
++		"mods": "Mods",
+ 		"audio": "Audio track",
+ 		"model": "Custom model",
+ 		"folder": "Folder",
+@@ -574,6 +575,8 @@
+ 	},
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
++		"modstitle": "Mods",
++		"modsnotice": "Mod support is not available yet. This panel is the starting point for a future importer.",
+ 		"model": "Model",
+ 		"skin": "Skin",
+ 		"skinmaterial": "Material map",
+diff --git a/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml b/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
+index 70c780b..d37f0c5 100644
+--- a/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
++++ b/GmProject/scripts/app_startup_interface_bench/app_startup_interface_bench.gml
+@@ -2,6 +2,7 @@
+ 
+ function app_startup_interface_bench()
+ {
++	bench_mods_selected = false
+ 	bench_open = false
+ 	bench_hover_ani = 0
+ 	bench_hover_ani_goal = 0
+@@ -38,6 +39,7 @@ function app_startup_interface_bench()
+ 	list_item_add("typelightsource", e_tl_type.LIGHT_SOURCE, "", null, icons.LIGHT_POINT, null, bench_click)
+ 	list_item_add("typeaudio", e_tl_type.AUDIO, "", null, icons.NOTE, null, bench_click)
+ 	list_item_add("typebackground", e_tl_type.BACKGROUND, "", null, icons.CLOUD, null, bench_click)
++	list_item_add("typemods", -1, "", null, icons.BLOCK, null, bench_click)
+ 	
+ 	list_edit = null
+ 	
+diff --git a/GmProject/scripts/bench_click/bench_click.gml b/GmProject/scripts/bench_click/bench_click.gml
+index 2bad788..b942582 100644
+--- a/GmProject/scripts/bench_click/bench_click.gml
++++ b/GmProject/scripts/bench_click/bench_click.gml
+@@ -3,8 +3,16 @@
+ 
+ function bench_click(type)
+ {
++	// Mods is a workbench panel, not a timeline or project asset.
++	if (type = -1)
++	{
++		bench_mods_selected = true
++		bench_settings_ani = 0
++		return 0
++	}
++
+ 	// Double clicked, create asset
+-	if (bench_settings.type = type && bench_show_ani_type = "")
++	if (!bench_mods_selected && bench_settings.type = type && bench_show_ani_type = "")
+ 	{
+ 		action_bench_create()
+ 		bench_show_ani_type = "hide"
+@@ -12,6 +20,8 @@ function bench_click(type)
+ 		return 0
+ 	}
+ 	
++	bench_mods_selected = false
++
+ 	with (bench_settings)
+ 	{
+ 		id.type = type
+diff --git a/GmProject/scripts/bench_draw/bench_draw.gml b/GmProject/scripts/bench_draw/bench_draw.gml
+index e020910..09191cb 100644
+--- a/GmProject/scripts/bench_draw/bench_draw.gml
++++ b/GmProject/scripts/bench_draw/bench_draw.gml
+@@ -91,7 +91,7 @@ function bench_draw()
+ 		
+ 		if (!skipasset)
+ 		{
+-			list_item_draw(bench_type_list.item[|i], dx, dy, 192, window_compact ? 28 : 32, (bench_settings.type = bench_type_list.item[|i].value), 0, 5)
++			list_item_draw(bench_type_list.item[|i], dx, dy, 192, window_compact ? 28 : 32, (bench_type_list.item[|i].value = -1 ? bench_mods_selected : (!bench_mods_selected && bench_settings.type = bench_type_list.item[|i].value)), 0, 5)
+ 			dy += (window_compact ? 28 : 32)
+ 		}
+ 		
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index ca0a7f0..1cbd861 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -27,6 +27,16 @@ function bench_draw_settings(bx, by, bw, bh)
+ 	
+ 	var sy = dy;
+ 	
++	// The Mods panel is a UI-only placeholder; never create a timeline asset.
++	if (bench_mods_selected)
++	{
++		draw_label(text_get("benchmodstitle"), dx, dy, fa_left, fa_top, c_text_main, a_text_main, font_caption)
++		dy += 32
++		draw_tooltip_label("benchmodsnotice", icons.INFO, e_toast.INFO)
++		draw_set_alpha(prevalpha)
++		return 0
++	}
++
+ 	// Settings
+ 	if (type_is_timeline(bench_settings.type))
+ 	{

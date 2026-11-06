@@ -1,0 +1,67 @@
+diff --git a/CppProject/World/FurnitureBake.cpp b/CppProject/World/FurnitureBake.cpp
+index 4cee772..a9ac107 100644
+--- a/CppProject/World/FurnitureBake.cpp
++++ b/CppProject/World/FurnitureBake.cpp
+@@ -42,6 +42,19 @@ Rect place(const Key& key, std::vector<Page>& pages) {
+  return {page,x+1,y+1,key.width,key.height};
+ }
+ }
++void MakeLabTubeGlassOpaque(Model& model) {
++ // The three translucent elements of this specific saved model are the blue
++ // glass walls. Keep fully transparent pixels invisible, including cutouts.
++ for (auto& elem:model.elements) {
++  if (elem.kind!=Element::Kind::Cube || elem.transparency!="TRANSLUCENT") continue;
++  bool hasTransparentPixel=false;
++  for (auto& face:elem.faces) for (auto& pixel:face.pixels) {
++   if ((pixel & 0xff000000u)==0) hasTransparentPixel=true;
++   else pixel |= 0xff000000u;
++  }
++  elem.transparency=hasTransparentPixel ? "CUTOUT_MIPPED" : "SOLID";
++ }
++}
+ bool Bake(const Model& model,BakedModel& result,std::string& error){
+  try{
+   BakedModel temp;std::vector<Page> pages;std::map<Key,Rect> cache;
+diff --git a/CppProject/World/FurnitureBake.hpp b/CppProject/World/FurnitureBake.hpp
+index a2948ed..9051e26 100644
+--- a/CppProject/World/FurnitureBake.hpp
++++ b/CppProject/World/FurnitureBake.hpp
+@@ -18,6 +18,8 @@ struct BakedElement {
+ };
+ struct Atlas { std::vector<std::uint32_t> pixels; Atlas():pixels(AtlasSize*AtlasSize,0){} };
+ struct BakedModel { std::array<std::vector<BakedElement>,2> states; std::vector<Atlas> atlases; int missingFaces=0, ignoredElements=0; };
++// Visual compatibility workaround for the known Lab Tube furniture hash only.
++void MakeLabTubeGlassOpaque(Model& model);
+ // Makes stable fixed-size atlas pages; leaves 1px extruded margins to prevent bleeding.
+ // Returns false without modifying result if model exceeds limits.
+ bool Bake(const Model& model, BakedModel& result, std::string& error);
+diff --git a/CppProject/World/FurnitureCache.cpp b/CppProject/World/FurnitureCache.cpp
+index 9c69eeb..529e5da 100644
+--- a/CppProject/World/FurnitureCache.cpp
++++ b/CppProject/World/FurnitureCache.cpp
+@@ -51,7 +51,11 @@ void PrepareFurniture(const QString& instance,const QString& cache,QJsonArray& b
+   QString hash=QFileInfo(path).baseName();if(seen.contains(hash))continue;seen.insert(hash);
+   QFile file(path);if(file.size()>16*1024*1024 || !file.open(QIODevice::ReadOnly)){report<<hash+": could not read";continue;}
+   QByteArray bytes=file.readAll();ImmersiveFurniture::Model model;ImmersiveFurniture::BakedModel baked;std::string error;
+-  if(!ImmersiveFurniture::ReadGzip(bytes.constData(),bytes.size(),model,error) || !ImmersiveFurniture::Bake(model,baked,error)){report<<hash+": "+QString::fromStdString(error);continue;}
++  if(!ImmersiveFurniture::ReadGzip(bytes.constData(),bytes.size(),model,error)){report<<hash+": "+QString::fromStdString(error);continue;}
++  // Scoped workaround: match this Lab Tube's Minecraft appearance without changing other furniture.
++  if(hash=="d2e4b086ef1106c7c237df118a3707488329cff1dc3f39d320aafb893e7e33d4")
++   ImmersiveFurniture::MakeLabTubeGlassOpaque(model);
++  if(!ImmersiveFurniture::Bake(model,baked,error)){report<<hash+": "+QString::fromStdString(error);continue;}
+   QString ns="mineimator_immersive", id=ns+":"+hash;
+   QString base=cache+"/assets/"+ns;
+   bool good=true;QStringList localTextures;
+diff --git a/CppProject/World/ModAssets.cpp b/CppProject/World/ModAssets.cpp
+index b36939b..e75c870 100644
+--- a/CppProject/World/ModAssets.cpp
++++ b/CppProject/World/ModAssets.cpp
+@@ -35,7 +35,7 @@
+ 
+ #include <functional>
+ 
+-#define MODWORLD_CACHE_FORMAT 4
++#define MODWORLD_CACHE_FORMAT 5
+ #define MODWORLD_MAX_JSON_SIZE (4 * 1024 * 1024)
+ #define MODWORLD_MAX_PNG_SIZE (16 * 1024 * 1024)
+ #define MODWORLD_MAX_NESTED_JAR_SIZE (64 * 1024 * 1024)

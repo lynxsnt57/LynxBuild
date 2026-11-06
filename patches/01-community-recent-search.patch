@@ -1,0 +1,206 @@
+diff --git a/GmProject/Mine-imator.yyp b/GmProject/Mine-imator.yyp
+index 9993627..c980405 100644
+--- a/GmProject/Mine-imator.yyp
++++ b/GmProject/Mine-imator.yyp
+@@ -870,6 +870,7 @@
+     {"id":{"name":"action_toolbar_save_as","path":"scripts/action_toolbar_save_as/action_toolbar_save_as.yy",},"order":12,},
+     {"id":{"name":"action_toolbar_settings","path":"scripts/action_toolbar_settings/action_toolbar_settings.yy",},"order":13,},
+     {"id":{"name":"action_toolbar_undo","path":"scripts/action_toolbar_undo/action_toolbar_undo.yy",},"order":14,},
++    {"id":{"name":"action_recent_search","path":"scripts/action_recent_search/action_recent_search.yy",},"order":7,},
+     {"id":{"name":"action_recent_sort","path":"scripts/action_recent_sort/action_recent_sort.yy",},"order":1,},
+     {"id":{"name":"action_recent_pin","path":"scripts/action_recent_pin/action_recent_pin.yy",},"order":3,},
+     {"id":{"name":"action_recent_remove","path":"scripts/action_recent_remove/action_recent_remove.yy",},"order":5,},
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index 7276791..72afab3 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -317,6 +317,8 @@
+ 			"future": "Last opened in the future"
+ 		},
+ 		"none": "The projects you've opened recently will appear here!",
++		"searchnone": "No projects were found by that name.",
++		"searchcaption": "Search...",
+ 		"sortdatenewest": "Date (newest)",
+ 		"sortdateoldest": "Date (oldest)",
+ 		"sortnameaz": "Name (A-Z)",
+diff --git a/GmProject/scripts/action_recent_search/action_recent_search.gml b/GmProject/scripts/action_recent_search/action_recent_search.gml
+new file mode 100644
+index 0000000..a6fe556
+--- /dev/null
++++ b/GmProject/scripts/action_recent_search/action_recent_search.gml
+@@ -0,0 +1,10 @@
++/// action_recent_search(search)
++/// @arg search
++
++function action_recent_search(search)
++{
++	recent_search = search
++	recent_scrollbar.value = 0
++	recent_scrollbar.value_goal = 0
++	recent_update()
++}
+diff --git a/GmProject/scripts/action_recent_search/action_recent_search.yy b/GmProject/scripts/action_recent_search/action_recent_search.yy
+new file mode 100644
+index 0000000..1c29f18
+--- /dev/null
++++ b/GmProject/scripts/action_recent_search/action_recent_search.yy
+@@ -0,0 +1,11 @@
++{
++  "resourceType": "GMScript",
++  "resourceVersion": "1.0",
++  "name": "action_recent_search",
++  "isDnD": false,
++  "isCompatibility": false,
++  "parent": {
++    "name": "Recent",
++    "path": "folders/Scripts/App/Actions/Recent.yy",
++  },
++}
+\ No newline at end of file
+diff --git a/GmProject/scripts/app_startup_recent/app_startup_recent.gml b/GmProject/scripts/app_startup_recent/app_startup_recent.gml
+index 1b57ee7..c7a0690 100644
+--- a/GmProject/scripts/app_startup_recent/app_startup_recent.gml
++++ b/GmProject/scripts/app_startup_recent/app_startup_recent.gml
+@@ -17,6 +17,9 @@ function app_startup_recent()
+ 	recent_thumbnail_width = 240
+ 	recent_thumbnail_height = 180
+ 	
++	recent_search = ""
++	tbx_recent_search = new_textbox(true, 0, "")
++	recent_list_amount_search = 0
+ 	recent_list_amount = 0
+ 	recent_list_update = false
+ 	
+diff --git a/GmProject/scripts/draw_recent/draw_recent.gml b/GmProject/scripts/draw_recent/draw_recent.gml
+index 31e5cf1..76dcd48 100644
+--- a/GmProject/scripts/draw_recent/draw_recent.gml
++++ b/GmProject/scripts/draw_recent/draw_recent.gml
+@@ -92,11 +92,11 @@ function draw_recent()
+ 		// Set scrollbar
+ 		var liststart = 0;
+ 		
+-		if ((recent_list_amount * 44) > hei - 28)
++		if ((recent_list_amount_search * 44) > hei - 28)
+ 		{
+ 			window_scroll_focus = string(recent_scrollbar)
+ 			
+-			scrollbar_draw(recent_scrollbar, e_scroll.VERTICAL, xx + wid - 12, yy + 28, hei - 28, recent_list_amount * 44)
++			scrollbar_draw(recent_scrollbar, e_scroll.VERTICAL, xx + wid - 12, yy + 28, hei - 28, recent_list_amount_search * 44)
+ 			liststart = snap(recent_scrollbar.value / 44, 1)
+ 			wid -= 12
+ 		}
+@@ -110,17 +110,20 @@ function draw_recent()
+ 		namex = xx + 12
+ 		timex = xx + 12 + namewidth + 12
+ 		
+-		// File name
+-		draw_label(text_get("recentname"), namex, recenty + 14, fa_left, fa_middle, c_text_secondary, a_text_secondary)
+-		
+-		// Last opened
+-		draw_label(text_get("recentlastopened"), timex, recenty + 14, fa_left, fa_middle, c_text_secondary, a_text_secondary)
++		if (recent_list_amount_search > 0)
++		{
++			// File name
++			draw_label(text_get("recentname"), namex, recenty + 14, fa_left, fa_middle, c_text_secondary, a_text_secondary)
++
++			// Last opened
++			draw_label(text_get("recentlastopened"), timex, recenty + 14, fa_left, fa_middle, c_text_secondary, a_text_secondary)
++		}
+ 		
+ 		recenty += 28
+ 		
+ 		// Draw list
+ 		draw_set_font(font_value)
+-		for (var i = liststart; i < recent_list_amount; i++)
++		for (var i = liststart; i < recent_list_amount_search; i++)
+ 		{
+ 			var hover = app_mouse_box(xx, recenty, wid, 44) && !popup_mouseon && !toast_mouseon && !context_menu_mouseon;
+ 			mouseon = hover
+@@ -198,11 +201,11 @@ function draw_recent()
+ 		// Set scrollbar
+ 		var liststart = 0;
+ 		
+-		if ((recent_list_amount * 256) > hei)
++		if ((recent_list_amount_search * 256) > hei)
+ 		{
+ 			window_scroll_focus = string(recent_scrollbar)
+ 			
+-			scrollbar_draw(recent_scrollbar, e_scroll.VERTICAL, xx + wid + 12, yy, hei, ceil(recent_list_amount/4) * 256)
++			scrollbar_draw(recent_scrollbar, e_scroll.VERTICAL, xx + wid + 12, yy, hei, ceil(recent_list_amount_search/4) * 256)
+ 			liststart = recent_scrollbar.value
+ 		}
+ 	
+@@ -214,7 +217,7 @@ function draw_recent()
+ 		
+ 		clip_begin(xx - 2, yy - 1, wid + 4, hei + 2)
+ 		
+-		for (var i = 0; i < recent_list_amount; i++)
++		for (var i = 0; i < recent_list_amount_search; i++)
+ 		{
+ 			// Only draw card if visible
+ 			if (cardy < yy + hei || cardy + 240 + 16 > yy)
+diff --git a/GmProject/scripts/recent_update/recent_update.gml b/GmProject/scripts/recent_update/recent_update.gml
+index 79a5527..186612f 100644
+--- a/GmProject/scripts/recent_update/recent_update.gml
++++ b/GmProject/scripts/recent_update/recent_update.gml
+@@ -34,12 +34,19 @@ function recent_update()
+ 	
+ 	// Put them back together
+ 	for (var i = 0; i < ds_list_size(pinnedlist); i++)
+-		ds_list_add(recent_list_display, pinnedlist[|i])
++	{
++		if (recent_search = "" || string_contains(string_upper(filename_name(pinnedlist[|i].name)), string_upper(recent_search)))
++			ds_list_add(recent_list_display, pinnedlist[|i])
++	}
+ 	
+ 	for (var i = 0; i < ds_list_size(unpinnedlist); i++)
+-		ds_list_add(recent_list_display, unpinnedlist[|i])
++	{
++		if (recent_search = "" || string_contains(string_upper(filename_name(unpinnedlist[|i].name)), string_upper(recent_search)))
++			ds_list_add(recent_list_display, unpinnedlist[|i])
++	}
+ 	
+-	recent_list_amount = ds_list_size(recent_list_display)
++	recent_list_amount_search = ds_list_size(recent_list_display)
++	recent_list_amount = ds_list_size(pinnedlist) + ds_list_size(unpinnedlist)
+ 	
+ 	// Cleanup
+ 	ds_list_destroy(pinnedlist)
+diff --git a/GmProject/scripts/window_draw_startup/window_draw_startup.gml b/GmProject/scripts/window_draw_startup/window_draw_startup.gml
+index 65071bc..5e5d26a 100644
+--- a/GmProject/scripts/window_draw_startup/window_draw_startup.gml
++++ b/GmProject/scripts/window_draw_startup/window_draw_startup.gml
+@@ -79,6 +79,15 @@ function window_draw_startup()
+ 		}
+ 	}
+ 	
++	// Search recent projects on a separate row so it does not overlap the header or buttons.
++	if (recent_list_amount > 0)
++	{
++		dx = (window_width / 2) - (dw / 2)
++		dy += 40
++		draw_textfield("searchprojects", dx, dy, min(256, dw), 24, tbx_recent_search, action_recent_search, text_get("recentsearchcaption"), "none")
++		dy += 40
++	}
++
+ 	// Show recent projects
+ 	if (recent_list_amount > 0)
+ 	{
+@@ -105,12 +114,15 @@ function window_draw_startup()
+ 		
+ 		dy += 72
+ 		
++		if (recent_list_amount_search = 0)
++			draw_label(text_get("recentsearchnone"), window_width / 2, dy, fa_center, fa_middle, c_accent, 1, font_heading_big)
++
+ 		var listheight;
+ 		
+ 		if (recent_display_mode = "list")
+-			listheight = 28 + min(window_height - dy, (min(ds_list_size(recent_list), 8) * 44))
++			listheight = 28 + min(max(0, window_height - dy - 28), (min(recent_list_amount_search, 8) * 44))
+ 		else
+-			listheight = min(window_height - dy, ceil(recent_list_amount / 4) * 256)
++			listheight = max(28, min(max(0, window_height - dy), ceil(recent_list_amount_search / 4) * 256))
+ 		
+ 		tab_control(listheight)
+ 		draw_recent(dx, dy, dw, listheight)

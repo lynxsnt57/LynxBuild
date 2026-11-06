@@ -1,0 +1,331 @@
+diff --git a/CppProject/World/ModAssets.cpp b/CppProject/World/ModAssets.cpp
+index c5da37a..e6a1143 100644
+--- a/CppProject/World/ModAssets.cpp
++++ b/CppProject/World/ModAssets.cpp
+@@ -4,7 +4,7 @@
+ // normalized copy to Mine-imator's own cache folder:
+ //   <cache>/assets/<namespace>/blockstates/*.json
+ //   <cache>/assets/<namespace>/models/**.json
+-//   <cache>/assets/<namespace>/textures/**.png   (first frame, 16x16)
++//   <cache>/assets/<namespace>/textures/**.png   (square atlas textures, up to 128x128)
+ //   <cache>/modworld.json                         (manifest read on startup)
+ //   <cache>/report.txt                            (human readable report)
+ //
+@@ -34,13 +34,14 @@
+ 
+ #include <functional>
+ 
+-#define MODWORLD_CACHE_FORMAT 1
++#define MODWORLD_CACHE_FORMAT 2
+ #define MODWORLD_MAX_JSON_SIZE (4 * 1024 * 1024)
+ #define MODWORLD_MAX_PNG_SIZE (16 * 1024 * 1024)
+ #define MODWORLD_MAX_NESTED_JAR_SIZE (64 * 1024 * 1024)
+ #define MODWORLD_MAX_ENTRIES 200000
+ #define MODWORLD_MAX_STATE_IDS 16384
+ #define MODWORLD_TEXTURE_SIZE 16
++#define MODWORLD_TEXTURE_MAX_SIZE 128
+ #define MODWORLD_PLACEHOLDER_NS "mineimator_missing"
+ #define MODWORLD_PLACEHOLDER_ID "mineimator_missing:unknown_block"
+ 
+@@ -320,17 +321,47 @@ namespace CppProject
+ 			return ok;
+ 		}
+ 
+-		QImage NormalizeTexture(const QImage& source)
++		// Static Minecraft sprites can be rectangular: normalize the whole image
++		// to a square atlas slot, preserving normalized UVs. Only animated sprites
++		// use their first frame; do not crop ordinary rectangular textures.
++		QImage NormalizeTexture(const QImage& source, const QJsonObject& metadata)
+ 		{
+-			QImage img = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+-			int side = qMin(img.width(), img.height());
++			QImage img = source.convertToFormat(QImage::Format_ARGB32);
++			if (img.isNull())
++				return QImage();
++
++			if (metadata.value("animation").isObject())
++			{
++				QJsonObject animation = metadata.value("animation").toObject();
++				int fw = animation.value("width").toInt(0);
++				int fh = animation.value("height").toInt(0);
++				if (fw <= 0 && fh <= 0)
++					fw = fh = qMin(img.width(), img.height());
++				else
++				{
++					if (fw <= 0) fw = img.width();
++					if (fh <= 0) fh = img.height();
++				}
++				if (fw <= 0 || fh <= 0 || fw > img.width() || fh > img.height() || img.width() % fw || img.height() % fh)
++					return QImage();
++				int frame = 0;
++				QJsonArray frames = animation.value("frames").toArray();
++				if (!frames.isEmpty())
++				{
++					QJsonValue first = frames.at(0);
++					frame = first.isObject() ? first.toObject().value("index").toInt(0) : first.toInt(0);
++				}
++				int columns = img.width() / fw, rows = img.height() / fh;
++				if (frame < 0 || frame >= columns * rows) frame = 0;
++				img = img.copy((frame % columns) * fw, (frame / columns) * fh, fw, fh);
++			}
++
++			const int side = qMin(MODWORLD_TEXTURE_MAX_SIZE, qMax(img.width(), img.height()));
+ 			if (side <= 0)
+ 				return QImage();
+-			img = img.copy(0, 0, side, side); // First animation frame
+-			if (side != MODWORLD_TEXTURE_SIZE)
+-				img = img.scaled(MODWORLD_TEXTURE_SIZE, MODWORLD_TEXTURE_SIZE, Qt::IgnoreAspectRatio,
+-					side > MODWORLD_TEXTURE_SIZE ? Qt::SmoothTransformation : Qt::FastTransformation);
+-			return img.convertToFormat(QImage::Format_ARGB32);
++			if (img.width() != side || img.height() != side)
++				img = img.scaled(side, side, Qt::IgnoreAspectRatio, Qt::FastTransformation);
++			return img;
+ 		}
+ 
+ 		QString TintCategory(const QString& texture)
+@@ -707,6 +738,7 @@ namespace CppProject
+ 		}
+ 
+ 		QSet<QString> writtenTextures;
++		int maxTextureSize = MODWORLD_TEXTURE_SIZE;
+ 		for (auto it = texturesByArchive.begin(); it != texturesByArchive.end(); ++it)
+ 		{
+ 			QByteArray holder;
+@@ -719,8 +751,13 @@ namespace CppProject
+ 				zip_int64_t index = zip_name_locate(archive, ref.entry.toUtf8().constData(), 0);
+ 				QByteArray data;
+ 				QImage img;
++				QJsonObject metadata;
++				zip_int64_t metaIndex = zip_name_locate(archive, (ref.entry + ".mcmeta").toUtf8().constData(), 0);
++				QByteArray metaBytes;
++				if (metaIndex >= 0 && ReadEntry(archive, static_cast<zip_uint64_t>(metaIndex), MODWORLD_MAX_JSON_SIZE, metaBytes))
++					ParseJsonObject(metaBytes, metadata);
+ 				if (index < 0 || !ReadEntry(archive, static_cast<zip_uint64_t>(index), MODWORLD_MAX_PNG_SIZE, data) ||
+-					!img.loadFromData(data, "PNG") || (img = NormalizeTexture(img)).isNull())
++					!img.loadFromData(data, "PNG") || (img = NormalizeTexture(img, metadata)).isNull())
+ 				{
+ 					missingTextures.append(name + " (unreadable)");
+ 					continue;
+@@ -729,7 +766,10 @@ namespace CppProject
+ 				QString out = cachePath + "/assets/" + name.left(colon) + "/textures/" + name.mid(colon + 1) + ".png";
+ 				QDir().mkpath(QFileInfo(out).absolutePath());
+ 				if (img.save(out, "PNG"))
++				{
+ 					writtenTextures.insert(name);
++					maxTextureSize = qMax(maxTextureSize, img.width());
++				}
+ 			}
+ 			zip_close(archive);
+ 		}
+@@ -795,11 +835,15 @@ namespace CppProject
+ 		for (const QString& name : writtenTextures)
+ 			textureList.append(name);
+ 		textureList.sort();
++		// Always reserve a slot for the missing-block placeholder.
++		textureList.removeAll(MODWORLD_PLACEHOLDER_NS ":block/unknown_block");
++		textureList.prepend(MODWORLD_PLACEHOLDER_NS ":block/unknown_block");
+ 
+ 		QJsonObject manifest;
+ 		manifest["format"] = MODWORLD_CACHE_FORMAT;
+ 		manifest["instance"] = instancePath;
+ 		manifest["mods"] = jars.size();
++		manifest["texture_size"] = maxTextureSize;
+ 		manifest["placeholder"] = MODWORLD_PLACEHOLDER_ID;
+ 		manifest["blocks"] = blockArray;
+ 		manifest["block_textures"] = QJsonArray::fromStringList(textureList);
+@@ -814,6 +858,7 @@ namespace CppProject
+ 		report << "Blocks skipped: " + QString::number(skippedBlocks.size());
+ 		report << "Models prepared: " + QString::number(parsedModels.size());
+ 		report << "Mod textures prepared: " + QString::number(writtenTextures.size() - 1);
++		report << "Maximum mod texture slot size: " + QString::number(maxTextureSize);
+ 		report << "Missing models: " + QString::number(missingModels.size() + invalidModels.size());
+ 		report << "Missing textures: " + QString::number(missingTextures.size());
+ 		report << "Time: " + QString::number(timer.Elapsed()) + " s";
+diff --git a/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml b/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
+index 8304f68..9d9f664 100644
+--- a/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
++++ b/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
+@@ -2,8 +2,9 @@
+ 
+ function res_load_pack_block_sheet(type, suffix)
+ {
+-	var blocksize, texlist, texanilist, surf, anisurf, fileslist;
++	var blocksize, anisize, texlist, texanilist, surf, anisurf, fileslist;
+ 	blocksize = null
++	anisize = null
+ 	fileslist = null
+ 	
+ 	debug_timer_start()
+@@ -67,6 +68,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 		if (file_exists_lib(fname))
+ 		{
+ 			var tex = texture_create(fname);
++			anisize = max(anisize, texture_width(tex))
+ 			ds_list_add(texanilist, tex)
+ 			
+ 			if (fileslist != null)
+@@ -95,6 +97,16 @@ function res_load_pack_block_sheet(type, suffix)
+ 	
+ 	if (blocksize = null)
+ 		blocksize = block_size
++	if (anisize = null)
++		anisize = block_size
++
++	// A resource pack can fall back to the default atlas. Keep its detail when
++	// the default atlas has high-resolution mod textures.
++	if (id != mc_res)
++	{
++		blocksize = max(blocksize, texture_width(mc_res.block_sheet_texture) / minecraft_block_sheet_size[0])
++		anisize = max(anisize, texture_width(mc_res.block_sheet_ani_texture[0]) / minecraft_block_animated_sheet_size[0])
++	}
+ 	
+ 	log("Block textures, blocksize", type, blocksize)
+ 	
+@@ -139,9 +151,10 @@ function res_load_pack_block_sheet(type, suffix)
+ 				{
+ 					if (id != mc_res)
+ 					{
++						var defaultsize = texture_width(mc_res.block_sheet_texture) / minecraft_block_sheet_size[0];
+ 						draw_texture_part(mc_res.block_sheet_texture, dx, dy,
+-										  (t mod minecraft_block_sheet_size[0]) * block_size, (t div minecraft_block_sheet_size[0]) * block_size,
+-										  block_size, block_size, blocksize / block_size, blocksize / block_size)
++										  (t mod minecraft_block_sheet_size[0]) * defaultsize, (t div minecraft_block_sheet_size[0]) * defaultsize,
++										  defaultsize, defaultsize, blocksize / defaultsize, blocksize / defaultsize)
+ 					}
+ 					else
+ 						draw_missing(dx, dy, blocksize, blocksize)
+@@ -167,7 +180,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 			gpu_set_blendmode_ext(bm_one, bm_inv_src_alpha)
+ 			gpu_set_tex_filter(true)
+ 			draw_clear_alpha(c_black, 0)
+-			draw_surface_ext(surf, 0, 0, 1 / block_size, 1 / block_size, 0, c_white, 1)
++			draw_surface_ext(surf, 0, 0, 1 / blocksize, 1 / blocksize, 0, c_white, 1)
+ 			gpu_set_tex_filter(false)
+ 			gpu_set_blendmode(bm_normal)
+ 		}
+@@ -191,7 +204,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 	// Create surfaces for animated blocks
+ 	log("Block textures", type, "animated block surfaces")
+ 	for (var f = 0; f < minecraft_block_animated_sheet_size[2]; f++)
+-		anisurf[f] = surface_create(minecraft_block_animated_sheet_size[0] * blocksize, minecraft_block_animated_sheet_size[1] * blocksize)
++		anisurf[f] = surface_create(minecraft_block_animated_sheet_size[0] * anisize, minecraft_block_animated_sheet_size[1] * anisize)
+ 	
+ 	draw_texture_start()
+ 	gpu_set_blendmode_ext(bm_one, bm_inv_src_alpha)
+@@ -200,8 +213,8 @@ function res_load_pack_block_sheet(type, suffix)
+ 	{
+ 		var tex, dx, dy;
+ 		tex = texanilist[|t]
+-		dx = (t mod minecraft_block_animated_sheet_size[0]) * blocksize
+-		dy = (t div minecraft_block_animated_sheet_size[0]) * blocksize
++		dx = (t mod minecraft_block_animated_sheet_size[0]) * anisize
++		dy = (t div minecraft_block_animated_sheet_size[0]) * anisize
+ 		
+ 		// Read animation data if available
+ 		var framefade, frametime, framelist, opaque;
+@@ -244,7 +257,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 		}
+ 		else
+ 		{
+-			texwid = blocksize
++			texwid = anisize
+ 			images = 1
+ 		}
+ 		
+@@ -290,16 +303,16 @@ function res_load_pack_block_sheet(type, suffix)
+ 					
+ 					// Draw part
+ 					if (opaque)
+-						draw_box(dx, dy, blocksize, blocksize, false, c_black, 1)
++						draw_box(dx, dy, anisize, anisize, false, c_black, 1)
+ 					//else if (type = "normal")
+-					//	draw_box(dx, dy, blocksize, blocksize, false, c_normal, 1)
++					//	draw_box(dx, dy, anisize, anisize, false, c_normal, 1)
+ 					
+-					draw_texture_part(tex, dx, dy, 0, floor(image) * texwid, blocksize, blocksize)
++					draw_texture_part(tex, dx, dy, 0, floor(image) * texwid, texwid, texwid, anisize / texwid, anisize / texwid)
+ 					
+ 					if (opaque)
+ 					{
+ 						gpu_set_blendmode_ext_sepalpha(bm_src_color, bm_one, bm_one, bm_one)
+-						draw_texture_part(tex, dx, dy, 0, floor(image) * texwid, blocksize, blocksize, 1, 1, c_black, 1)
++						draw_texture_part(tex, dx, dy, 0, floor(image) * texwid, texwid, texwid, anisize / texwid, anisize / texwid, c_black, 1)
+ 						gpu_set_blendmode_ext(bm_one, bm_inv_src_alpha)
+ 					}
+ 					
+@@ -307,7 +320,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 					if (framefade)
+ 					{
+ 						gpu_set_blendmode_ext_sepalpha(bm_src_alpha, bm_inv_src_alpha, bm_one, bm_inv_src_alpha) // Windows only
+-						draw_texture_part(tex, dx, dy, 0, nextimage * texwid, blocksize, blocksize, 1, 1, c_white, frac(image))
++						draw_texture_part(tex, dx, dy, 0, nextimage * texwid, texwid, texwid, anisize / texwid, anisize / texwid, c_white, frac(image))
+ 						gpu_set_blendmode_ext(bm_one, bm_inv_src_alpha)
+ 					}
+ 				}
+@@ -319,17 +332,18 @@ function res_load_pack_block_sheet(type, suffix)
+ 					{
+ 						if (id != mc_res)
+ 						{
++							var defaultanisize = texture_width(mc_res.block_sheet_ani_texture[f]) / minecraft_block_animated_sheet_size[0];
+ 							draw_texture_part(mc_res.block_sheet_ani_texture[f], dx, dy,
+-												(t mod minecraft_block_animated_sheet_size[0]) * block_size, (t div minecraft_block_animated_sheet_size[0]) * block_size,
+-												block_size, block_size, blocksize / block_size, blocksize / block_size)
++												(t mod minecraft_block_animated_sheet_size[0]) * defaultanisize, (t div minecraft_block_animated_sheet_size[0]) * defaultanisize,
++												defaultanisize, defaultanisize, anisize / defaultanisize, anisize / defaultanisize)
+ 						}
+ 						else
+-							draw_missing(dx, dy, blocksize, blocksize)
++							draw_missing(dx, dy, anisize, anisize)
+ 					}
+ 					else if (type = "material")
+-						draw_box(dx, dy, blocksize, blocksize, false, c_black, 1)
++						draw_box(dx, dy, anisize, anisize, false, c_black, 1)
+ 					//else if (type = "normal")
+-					//	draw_box(dx, dy, blocksize, blocksize, false, c_normal, 1)
++					//	draw_box(dx, dy, anisize, anisize, false, c_normal, 1)
+ 				}
+ 			}
+ 			surface_reset_target()
+@@ -349,7 +363,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 		surface_set_target(previewanisurf)
+ 		{
+ 			draw_clear_alpha(c_black, 0)
+-			draw_surface_ext(anisurf[0], 0, 0, 1 / block_size, 1 / block_size, 0, c_white, 1)
++			draw_surface_ext(anisurf[0], 0, 0, 1 / anisize, 1 / anisize, 0, c_white, 1)
+ 		}
+ 		surface_reset_target()
+ 		
+@@ -447,8 +461,8 @@ function res_load_pack_block_sheet(type, suffix)
+ 			}
+ 		
+ 			var bx, by, dep;
+-			bx = (t mod minecraft_block_animated_sheet_size[0]) * blocksize
+-			by = (t div minecraft_block_animated_sheet_size[0]) * blocksize
++			bx = (t mod minecraft_block_animated_sheet_size[0]) * anisize
++			by = (t div minecraft_block_animated_sheet_size[0]) * anisize
+ 			dep = e_block_depth.DEPTH0
+ 		
+ 			// Sample
+@@ -456,6 +470,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 			{
+ 				var spos, alpha;
+ 				spos = samplepos[s]
++				spos = point2D(spos[@ X] * anisize / blocksize, spos[@ Y] * anisize / blocksize)
+ 				alpha = buffer_read_alpha(bx + spos[@ X], by + spos[@ Y], wid)
+ 			
+ 				if (alpha < 1) // Transparent
+diff --git a/GmProject/scripts/world_import/world_import.gml b/GmProject/scripts/world_import/world_import.gml
+index 6fa6b37..758f15a 100644
+--- a/GmProject/scripts/world_import/world_import.gml
++++ b/GmProject/scripts/world_import/world_import.gml
+@@ -179,7 +179,9 @@ function modworld_add_textures()
+ 
+ 	var texlist, maxslots, added;
+ 	texlist = mod_assets_map[?"block_textures"]
+-	maxslots = minecraft_block_sheet_size[0] * 512 // Keep the sheet below 8192 pixels at 16x16
++	// Limit default-pack atlas height to 8192 pixels at its largest mod texture size.
++	var modtexsize = value_get_real(mod_assets_map[?"texture_size"], 16);
++	maxslots = minecraft_block_sheet_size[0] * floor(8192 / max(16, modtexsize))
+ 	added = 0
+ 
+ 	if (ds_list_valid(texlist))

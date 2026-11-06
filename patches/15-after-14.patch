@@ -1,0 +1,1907 @@
+diff --git a/CppProject/World/BlockStyle.cpp b/CppProject/World/BlockStyle.cpp
+index 1677f85..72d69f9 100644
+--- a/CppProject/World/BlockStyle.cpp
++++ b/CppProject/World/BlockStyle.cpp
+@@ -40,6 +40,22 @@ namespace CppProject
+ 					if (previewColors[i] == color) // Already added
+ 						return (uint16_t)i;
+ 
++			// The preview vertex stores the color position in 10 bits. When mods add
++			// more colors than fit, re-use the closest existing color instead.
++			if (previewColors.size() >= 1024)
++			{
++				IntType best = 0, bestDist = -1;
++				for (IntType i = 0; i < previewColors.size(); i++)
++				{
++					const QColor& c = previewColors[i];
++					IntType dr = c.red() - color.red(), dg = c.green() - color.green(), db = c.blue() - color.blue(), da = c.alpha() - color.alpha();
++					IntType dist = dr * dr + dg * dg + db * db + da * da;
++					if (bestDist < 0 || dist < bestDist)
++						best = i, bestDist = dist;
++				}
++				return (uint16_t)best;
++			}
++
+ 			uint16_t nextPos = previewColors.size();
+ 			previewImage.setPixelColor(QPoint(nextPos % PREVIEW_TEXTURE_SIZE, nextPos / PREVIEW_TEXTURE_SIZE), color);
+ 			previewColors.append(color);
+diff --git a/CppProject/World/Builder.cpp b/CppProject/World/Builder.cpp
+index f49658a..02d70e3 100644
+--- a/CppProject/World/Builder.cpp
++++ b/CppProject/World/Builder.cpp
+@@ -6,7 +6,8 @@
+ #include "GZIP.hpp"
+ 
+ #define BLOCK_MESH_CACHE_ENABLED 1
+-#define BLOCK_MESH_CACHE_FORMAT 2
++#define BLOCK_MESH_CACHE_FORMAT 4 // Stores sheet size and mod asset signature
++#define BLOCK_MESH_CACHE_FORMAT_LEGACY 2
+ 
+ namespace CppProject
+ {
+@@ -538,6 +539,28 @@ namespace CppProject
+ 		return true;
+ 	}
+ 
++	// Block sheet size in slots. Mod textures add rows to the sheet, which
++	// changes the texture coordinates stored in cached block meshes.
++	static qint64 blockSheetWidth = 0, blockSheetHeight = 0, blockSheetBaseHeight = 0;
++	static QByteArray blockSheetModSignature;
++
++	void modworld_set_sheet_info(IntType width, IntType height, IntType baseHeight)
++	{
++		blockSheetWidth = (qint64)width;
++		blockSheetHeight = (qint64)height;
++		blockSheetBaseHeight = (qint64)baseHeight;
++		blockSheetModSignature.clear();
++		if (!World::modCacheDir.isEmpty())
++		{
++			QFile signature(World::modCacheDir + "/signature.txt");
++			if (signature.open(QIODevice::ReadOnly))
++				blockSheetModSignature = signature.readAll().trimmed();
++			// Do not confuse a missing signature with the vanilla asset set.
++			if (blockSheetModSignature.isEmpty())
++				blockSheetModSignature = "mod-signature-unavailable";
++		}
++	}
++
+ 	void res_save_block_cache(Scope<obj_resource> self, StringType filename)
+ 	{
+ 	#if !BLOCK_MESH_CACHE_ENABLED
+@@ -576,6 +599,9 @@ namespace CppProject
+ 		// Save format
+ 		uchar format = BLOCK_MESH_CACHE_FORMAT;
+ 		out << format;
++		out << blockSheetWidth;
++		out << blockSheetHeight;
++		out << blockSheetModSignature;
+ 
+ 		// Save size
+ 		out << (qint64)res->scenery_size.x;
+@@ -624,7 +650,22 @@ namespace CppProject
+ 		// Check format
+ 		uchar format;
+ 		in >> format;
+-		if (format != BLOCK_MESH_CACHE_FORMAT)
++		if (format == BLOCK_MESH_CACHE_FORMAT_LEGACY) // Created without mod textures
++		{
++			if (!blockSheetModSignature.isEmpty() || blockSheetHeight != blockSheetBaseHeight)
++				return false;
++		}
++		else if (format == BLOCK_MESH_CACHE_FORMAT)
++		{
++			qint64 sheetWidth, sheetHeight;
++			QByteArray modSignature;
++			in >> sheetWidth;
++			in >> sheetHeight;
++			in >> modSignature;
++			if (in.status() != QDataStream::Ok || sheetWidth != blockSheetWidth || sheetHeight != blockSheetHeight || modSignature != blockSheetModSignature)
++				return false;
++		}
++		else
+ 			return false;
+ 
+ 		// Load size
+diff --git a/CppProject/World/Import.cpp b/CppProject/World/Import.cpp
+index d1cbe56..a1b356e 100644
+--- a/CppProject/World/Import.cpp
++++ b/CppProject/World/Import.cpp
+@@ -7,35 +7,109 @@
+ #include <QFileDialog>
+ #include <QMessageBox>
+ #include <QFileInfo>
++#include <QPushButton>
+ 
+ namespace CppProject
+ {
+-	// Session-only choice. Saves and mods are read, never modified.
+-	static QString selectedInstanceSaves;
+-
+-	void world_import_choose_instance()
+-	{
+-		const QString folder = QFileDialog::getExistingDirectory(nullptr,
+-			"Select Minecraft instance folder", QString(), QFileDialog::ShowDirsOnly);
+-		if (folder.isEmpty()) return;
+-		const QDir instance(folder);
+-		const QDir saves(instance.filePath("saves"));
+-		if (!saves.exists()) {
+-			QMessageBox::warning(nullptr, "Minecraft instance",
+-				"This folder has no saves subfolder. Select the game/instance folder, not the saves folder.");
+-			return;
++	// Instance folder whose "saves" are listed ("" = default .minecraft).
++	// Saves and mods are only read, never modified.
++	static QString selectedInstance;
++
++	static int CountModJars(const QString& instance)
++	{
++		const QDir mods(QDir(instance).filePath("mods"));
++		if (instance.isEmpty() || !mods.exists())
++			return 0;
++		return mods.entryList(QStringList() << "*.jar", QDir::Files | QDir::Readable | QDir::NoDotAndDotDot, QDir::IgnoreCase).size();
++	}
++
++	void world_import_set_instance(StringType folder)
++	{
++		selectedInstance = folder.QStr();
++	}
++
++	StringType world_import_choose_instance(StringType loadedInstance)
++	{
++		const QString loaded = loadedInstance.QStr();
++		QMessageBox box;
++		box.setWindowTitle("Minecraft instance");
++		box.setIcon(QMessageBox::Question);
++		box.setText("Choose the game/instance folder of a modded Minecraft Java installation (1.20.1 - 26.2). "
++			"Its worlds are listed in the world importer and the blocks of its mods are loaded when Mine-imator starts.");
++		box.setInformativeText(QString("Current folder: %1\nMod blocks loaded now: %2")
++			.arg(selectedInstance.isEmpty() ? QString("default .minecraft") : selectedInstance)
++			.arg(loaded.isEmpty() ? QString("none") : loaded));
++		QPushButton* chooseButton = box.addButton("Choose folder...", QMessageBox::AcceptRole);
++		QPushButton* defaultButton = selectedInstance.isEmpty() ? nullptr : box.addButton("Use default .minecraft", QMessageBox::ResetRole);
++		box.addButton(QMessageBox::Cancel);
++		box.exec();
++
++		QString result;
++		if (box.clickedButton() == chooseButton)
++		{
++			const QString folder = QFileDialog::getExistingDirectory(nullptr, "Select Minecraft instance folder",
++				selectedInstance, QFileDialog::ShowDirsOnly);
++			if (folder.isEmpty())
++				return "";
++
++			QDir instance(folder);
++			if (!QDir(instance.filePath("saves")).exists())
++			{
++				// Accept the saves folder itself or a world folder selected by mistake
++				BoolType found = false;
++				if (QFileInfo::exists(instance.filePath("level.dat")))
++					instance.cdUp();
++				if (instance.dirName() == "saves" && instance.cdUp())
++					found = QDir(instance.filePath("saves")).exists();
++
++				if (!found)
++				{
++					QMessageBox::warning(nullptr, "Minecraft instance",
++						"This folder has no \"saves\" subfolder. Select the game/instance folder that contains \"saves\" and \"mods\".");
++					return "";
++				}
++			}
++			result = QDir::cleanPath(instance.absolutePath());
+ 		}
+-		selectedInstanceSaves = saves.absolutePath();
+-		const QDir mods(instance.filePath("mods"));
+-		const int jarCount = mods.exists()
+-			? mods.entryList(QStringList() << "*.jar", QDir::Files | QDir::Readable | QDir::NoDotAndDotDot, QDir::IgnoreCase).size()
+-			: 0;
+-		QMessageBox::information(nullptr, "Minecraft instance",
+-			QString("Worlds will be listed from:\n%1\n\nMod JAR files found: %2\n\n"
+-				"Experimental foundation only: mod blocks and textures are NOT imported by this patch. "
+-				"Unknown mod blocks may be absent. The folder choice lasts until the program closes.")
+-				.arg(selectedInstanceSaves).arg(jarCount));
++		else if (defaultButton && box.clickedButton() == defaultButton)
++			result = "";
++		else
++			return "";
++
++		selectedInstance = result;
++
++		if (result != loaded)
++		{
++			const int jars = CountModJars(result);
++			QString message = "Worlds from the selected folder are listed now.";
++			if (jars > 0)
++				message += QString("\n\nMod blocks are loaded when Mine-imator starts. Restart Mine-imator to load the blocks of %1 mod file(s). "
++					"The first start after a change can take a while.").arg(jars);
++			else if (!loaded.isEmpty())
++				message += "\n\nRestart Mine-imator to unload the mod blocks of the previous folder.";
++			QMessageBox::information(nullptr, "Minecraft instance", message);
++		}
++
++		return result.isEmpty() ? StringType("<default>") : StringType(result);
++	}
++
++	void modworld_set_cache_dir(StringType dir)
++	{
++		World::modCacheDir = dir.QStr();
+ 	}
++
++	void world_import_dimension_menu_add_mods()
++	{
++		if (!World::saves.contains(global::_app->world_import_world_root))
++			return;
++
++		QStringList dims = World::saves[global::_app->world_import_world_root].dimDir.keys();
++		dims.sort();
++		for (const QString& dim : dims)
++			if (dim.contains(':'))
++				menu_add_item({ StringType(dim), StringType(dim) });
++	}
++
+ 	void world_import_startup()
+ 	{
+ 		World::Init();
+@@ -72,6 +146,8 @@ namespace CppProject
+ 
+ 		SaveInfo& save = World::saves[root];
+ 		StringType saveDim = dim.IsEmpty() ? StringType(save.playerDim) : dim;
++		if (!save.dimDir.contains(saveDim.QStr())) // Missing (mod) dimension
++			saveDim = "overworld";
+ 		global::_app->world_import_world_root = root;
+ 		global::_app->world_import_world_name = save.name;
+ 		global::_app->world_import_dimension = saveDim;
+@@ -120,8 +196,8 @@ namespace CppProject
+ 
+ 	StringType world_import_get_saves_dir()
+ 	{
+-		if (!selectedInstanceSaves.isEmpty())
+-			return selectedInstanceSaves;
++		if (!selectedInstance.isEmpty())
++			return QDir(selectedInstance).filePath("saves");
+ 	#if OS_WINDOWS
+ 		return QFileInfo(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).path() + "/.minecraft/saves";
+ 	#elif OS_MAC
+diff --git a/CppProject/World/ModAssets.cpp b/CppProject/World/ModAssets.cpp
+new file mode 100644
+index 0000000..606f029
+--- /dev/null
++++ b/CppProject/World/ModAssets.cpp
+@@ -0,0 +1,843 @@
++// Mod asset cache for importing modded Java worlds (Minecraft Java 1.20.1 - 26.2).
++//
++// Reads block assets from the JAR files in "<instance>/mods" and writes a
++// normalized copy to Mine-imator's own cache folder:
++//   <cache>/assets/<namespace>/blockstates/*.json
++//   <cache>/assets/<namespace>/models/**.json
++//   <cache>/assets/<namespace>/textures/**.png   (first frame, 16x16)
++//   <cache>/modworld.json                         (manifest read on startup)
++//   <cache>/report.txt                            (human readable report)
++//
++// The instance, its worlds and its mods are only read. No code from a mod is
++// executed; only JSON and PNG files are parsed.
++
++#include "Generated/Scripts.hpp"
++
++#include <zip.h>
++
++#include <QCryptographicHash>
++#include <QDateTime>
++#include <QDir>
++#include <QDirIterator>
++#include <QFile>
++#include <QFileInfo>
++#include <QHash>
++#include <QImage>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QRegularExpression>
++#include <QSet>
++#include <QTextStream>
++
++#include <functional>
++
++#define MODWORLD_CACHE_FORMAT 1
++#define MODWORLD_MAX_JSON_SIZE (4 * 1024 * 1024)
++#define MODWORLD_MAX_PNG_SIZE (16 * 1024 * 1024)
++#define MODWORLD_MAX_NESTED_JAR_SIZE (64 * 1024 * 1024)
++#define MODWORLD_MAX_ENTRIES 200000
++#define MODWORLD_MAX_STATE_IDS 16384
++#define MODWORLD_TEXTURE_SIZE 16
++#define MODWORLD_PLACEHOLDER_NS "mineimator_missing"
++#define MODWORLD_PLACEHOLDER_ID "mineimator_missing:unknown_block"
++
++namespace CppProject
++{
++	namespace
++	{
++		struct ArchiveRef
++		{
++			QString jarPath;	// Top-level JAR on disk
++			QString nestedName;	// Entry name of a nested JAR, or empty
++			QString modFile;	// File name used in the report
++		};
++
++		struct TextureRef
++		{
++			int archive = -1;
++			QString entry;
++		};
++
++		struct ModBlock
++		{
++			QString id;
++			QStringList stateOrder;
++			QHash<QString, QStringList> states;
++			QStringList models;
++			QJsonObject json;
++		};
++
++		const QRegularExpression& NamespaceRegex()
++		{
++			static const QRegularExpression re("^[a-z0-9_.\\-]+$");
++			return re;
++		}
++
++		const QRegularExpression& PathRegex()
++		{
++			static const QRegularExpression re("^[a-z0-9_.\\-/]+$");
++			return re;
++		}
++
++		BoolType ValidPath(const QString& path)
++		{
++			if (path.isEmpty() || path.startsWith('/') || path.endsWith('/') || !PathRegex().match(path).hasMatch())
++				return false;
++			for (const QString& part : path.split('/'))
++				if (part.isEmpty() || part == "." || part == "..")
++					return false;
++			return true;
++		}
++
++		// Removes // and /* */ comments and trailing commas outside strings.
++		// Several mods ship slightly lenient JSON that Minecraft accepts.
++		QByteArray SanitizeJson(const QByteArray& in)
++		{
++			QByteArray out;
++			out.reserve(in.size());
++			BoolType inString = false, escape = false;
++			for (int i = 0; i < in.size(); i++)
++			{
++				char c = in[i];
++				if (inString)
++				{
++					out += c;
++					if (escape) escape = false;
++					else if (c == '\\') escape = true;
++					else if (c == '"') inString = false;
++					continue;
++				}
++				if (c == '"') { inString = true; out += c; continue; }
++				if (c == '/' && i + 1 < in.size() && in[i + 1] == '/')
++				{
++					while (i < in.size() && in[i] != '\n') i++;
++					out += '\n';
++					continue;
++				}
++				if (c == '/' && i + 1 < in.size() && in[i + 1] == '*')
++				{
++					i += 2;
++					while (i + 1 < in.size() && !(in[i] == '*' && in[i + 1] == '/')) i++;
++					i++;
++					continue;
++				}
++				if (c == ']' || c == '}')
++				{
++					int j = out.size() - 1;
++					while (j >= 0 && (out[j] == ' ' || out[j] == '\t' || out[j] == '\r' || out[j] == '\n')) j--;
++					if (j >= 0 && out[j] == ',')
++						out.remove(j, 1);
++				}
++				out += c;
++			}
++			return out;
++		}
++
++		BoolType ParseJsonObject(const QByteArray& data, QJsonObject& out)
++		{
++			QByteArray bytes = data;
++			if (bytes.startsWith("\xEF\xBB\xBF")) // UTF-8 BOM
++				bytes.remove(0, 3);
++			QJsonParseError err;
++			QJsonDocument doc = QJsonDocument::fromJson(bytes, &err);
++			if (err.error != QJsonParseError::NoError)
++				doc = QJsonDocument::fromJson(SanitizeJson(bytes), &err);
++			if (err.error != QJsonParseError::NoError || !doc.isObject())
++				return false;
++			out = doc.object();
++			return true;
++		}
++
++		BoolType ReadEntry(zip_t* archive, zip_uint64_t index, zip_uint64_t maxSize, QByteArray& out)
++		{
++			zip_stat_t st;
++			zip_stat_init(&st);
++			if (zip_stat_index(archive, index, 0, &st) != 0 || !(st.valid & ZIP_STAT_SIZE) || st.size > maxSize)
++				return false;
++			zip_file_t* file = zip_fopen_index(archive, index, 0);
++			if (!file)
++				return false;
++			out.resize(static_cast<int>(st.size));
++			zip_uint64_t pos = 0;
++			while (pos < st.size)
++			{
++				zip_int64_t n = zip_fread(file, out.data() + pos, st.size - pos);
++				if (n <= 0)
++				{
++					zip_fclose(file);
++					return false;
++				}
++				pos += static_cast<zip_uint64_t>(n);
++			}
++			zip_fclose(file);
++			return true;
++		}
++
++		// Opens a top-level JAR or a JAR nested inside it. "holder" keeps the
++		// nested archive data alive while the returned archive is open.
++		zip_t* OpenArchive(const ArchiveRef& ref, QByteArray& holder)
++		{
++			int err = 0;
++			zip_t* outer = zip_open(ref.jarPath.toUtf8().constData(), ZIP_RDONLY, &err);
++			if (!outer || ref.nestedName.isEmpty())
++				return outer;
++
++			zip_int64_t index = zip_name_locate(outer, ref.nestedName.toUtf8().constData(), 0);
++			BoolType ok = (index >= 0 && ReadEntry(outer, static_cast<zip_uint64_t>(index), MODWORLD_MAX_NESTED_JAR_SIZE, holder));
++			zip_close(outer);
++			if (!ok)
++				return nullptr;
++
++			zip_error_t zerr;
++			zip_error_init(&zerr);
++			zip_source_t* src = zip_source_buffer_create(holder.constData(), holder.size(), 0, &zerr);
++			if (!src)
++			{
++				zip_error_fini(&zerr);
++				return nullptr;
++			}
++			zip_t* nested = zip_open_from_source(src, ZIP_RDONLY, &zerr);
++			if (!nested)
++				zip_source_free(src);
++			zip_error_fini(&zerr);
++			return nested;
++		}
++
++		QString JsonValueToState(const QJsonValue& value)
++		{
++			if (value.isBool())
++				return value.toBool() ? "true" : "false";
++			if (value.isDouble())
++			{
++				double d = value.toDouble();
++				if (d == (double)(qint64)d)
++					return QString::number((qint64)d);
++				return QString::number(d);
++			}
++			return value.toString();
++		}
++
++		void AddStateValue(ModBlock& block, const QString& name, const QString& value)
++		{
++			QString n = name.trimmed(), v = value.trimmed();
++			if (n.isEmpty() || v.isEmpty())
++				return;
++			if (!block.states.contains(n))
++				block.stateOrder.append(n);
++			QStringList& values = block.states[n];
++			if (!values.contains(v))
++				values.append(v);
++		}
++
++		void CollectWhen(ModBlock& block, const QJsonObject& when)
++		{
++			for (auto it = when.begin(); it != when.end(); ++it)
++			{
++				if ((it.key() == "OR" || it.key() == "AND") && it.value().isArray())
++				{
++					for (const QJsonValue& sub : it.value().toArray())
++						if (sub.isObject())
++							CollectWhen(block, sub.toObject());
++					continue;
++				}
++				for (const QString& v : JsonValueToState(it.value()).split('|'))
++					AddStateValue(block, it.key(), v);
++			}
++		}
++
++		// Multipart conditions may use JSON numbers/booleans, Mine-imator expects strings
++		QJsonObject NormalizeWhen(const QJsonObject& when)
++		{
++			QJsonObject out;
++			for (auto it = when.begin(); it != when.end(); ++it)
++			{
++				if ((it.key() == "OR" || it.key() == "AND") && it.value().isArray())
++				{
++					QJsonArray list;
++					for (const QJsonValue& sub : it.value().toArray())
++						if (sub.isObject())
++							list.append(NormalizeWhen(sub.toObject()));
++					out[it.key()] = list;
++				}
++				else
++					out[it.key()] = JsonValueToState(it.value());
++			}
++			return out;
++		}
++
++		void CollectModels(ModBlock& block, const QJsonValue& value)
++		{
++			if (value.isArray())
++			{
++				for (const QJsonValue& v : value.toArray())
++					CollectModels(block, v);
++				return;
++			}
++			if (value.isObject())
++			{
++				QString model = value.toObject().value("model").toString();
++				if (!model.isEmpty() && !block.models.contains(model))
++					block.models.append(model);
++			}
++		}
++
++		// "stone" -> "minecraft:stone", lower case
++		QString NormalizeId(QString id)
++		{
++			id = id.trimmed().toLower();
++			if (!id.contains(':'))
++				id = "minecraft:" + id;
++			return id;
++		}
++
++		// Texture name as used by Mine-imator: vanilla names have no namespace
++		QString TextureListName(const QString& id)
++		{
++			QString n = NormalizeId(id);
++			if (n.startsWith("minecraft:"))
++				return n.mid(10);
++			return n;
++		}
++
++		QString TextureValue(const QJsonValue& value)
++		{
++			if (value.isObject())
++				return value.toObject().value("sprite").toString();
++			return value.toString();
++		}
++
++		BoolType WriteFile(const QString& path, const QByteArray& data)
++		{
++			QDir().mkpath(QFileInfo(path).absolutePath());
++			QFile file(path);
++			if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
++				return false;
++			BoolType ok = (file.write(data) == data.size());
++			file.close();
++			return ok;
++		}
++
++		QImage NormalizeTexture(const QImage& source)
++		{
++			QImage img = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
++			int side = qMin(img.width(), img.height());
++			if (side <= 0)
++				return QImage();
++			img = img.copy(0, 0, side, side); // First animation frame
++			if (side != MODWORLD_TEXTURE_SIZE)
++				img = img.scaled(MODWORLD_TEXTURE_SIZE, MODWORLD_TEXTURE_SIZE, Qt::IgnoreAspectRatio,
++					side > MODWORLD_TEXTURE_SIZE ? Qt::SmoothTransformation : Qt::FastTransformation);
++			return img.convertToFormat(QImage::Format_ARGB32);
++		}
++
++		QString TintCategory(const QString& texture)
++		{
++			QString t = texture.toLower();
++			if (t.contains("leaves") || t.contains("leaf") || t.contains("foliage") || t.contains("vine"))
++				return "foliage";
++			if (t.contains("grass") || t.contains("fern"))
++				return "grass";
++			return "";
++		}
++	}
++
++	// Prepares (or re-uses) the mod asset cache for the given instance folder.
++	// Returns the path of the manifest, or "" when nothing could be prepared.
++	StringType modworld_prepare_assets(StringType instanceDir, StringType cacheDir)
++	{
++		const QString instancePath = QDir(instanceDir.QStr()).absolutePath();
++		const QDir modsDir(instancePath + "/mods");
++		const QString cachePath = QDir(cacheDir.QStr()).absolutePath();
++		const QString manifestPath = cachePath + "/modworld.json";
++		const QString signaturePath = cachePath + "/signature.txt";
++		const QString reportPath = cachePath + "/report.txt";
++		QDir().mkpath(cachePath);
++
++		if (instanceDir.IsEmpty() || !QDir(instancePath).exists())
++			return "";
++
++		// Signature of the installed mods, used to re-use the cache
++		QFileInfoList jars = modsDir.exists()
++			? modsDir.entryInfoList(QStringList() << "*.jar", QDir::Files | QDir::Readable, QDir::Name | QDir::IgnoreCase)
++			: QFileInfoList();
++		QByteArray signature = "modworld " + QByteArray::number(MODWORLD_CACHE_FORMAT) + "\n" + instancePath.toUtf8() + "\n";
++		for (const QFileInfo& jar : jars)
++			signature += jar.fileName().toUtf8() + "|" + QByteArray::number(jar.size()) + "|" +
++				QByteArray::number(jar.lastModified().toMSecsSinceEpoch()) + "\n";
++		const QByteArray signatureHash = QCryptographicHash::hash(signature, QCryptographicHash::Sha1).toHex();
++
++		{
++			QFile sigFile(signaturePath);
++			if (QFileInfo::exists(manifestPath) && sigFile.open(QIODevice::ReadOnly) && sigFile.readAll().trimmed() == signatureHash)
++			{
++				DEBUG("Mod asset cache is up to date: " + cachePath);
++				return manifestPath;
++			}
++		}
++
++		DEBUG("Building mod asset cache for " + instancePath + " (" + NumStr(jars.size()) + " JAR files)");
++		Timer timer;
++
++		// Remove only files created by this cache
++		QDir(cachePath + "/assets").removeRecursively();
++		QFile::remove(manifestPath);
++		QFile::remove(signaturePath);
++		QFile::remove(reportPath);
++
++		QStringList report;
++		QStringList archiveErrors;
++		QVector<ArchiveRef> archives;
++		QHash<QString, QByteArray> blockstateData, modelData; // "ns:path" -> JSON
++		QHash<QString, TextureRef> textureRefs; // "ns:path" -> entry
++		QSet<QString> namespaces;
++
++		// Pass 1: index every archive and read the JSON files
++		auto scanArchive = [&](const ArchiveRef& ref, auto& scanSelf, int depth) -> void
++		{
++			QByteArray holder;
++			zip_t* archive = OpenArchive(ref, holder);
++			if (!archive)
++			{
++				archiveErrors.append(ref.modFile + (ref.nestedName.isEmpty() ? "" : " -> " + ref.nestedName) + ": cannot open");
++				return;
++			}
++			const int archiveIndex = archives.size();
++			archives.append(ref);
++
++			zip_int64_t count = zip_get_num_entries(archive, 0);
++			if (count < 0 || count > MODWORLD_MAX_ENTRIES)
++			{
++				archiveErrors.append(ref.modFile + ": invalid or excessive number of entries");
++				zip_close(archive);
++				return;
++			}
++
++			QStringList nestedJars;
++			for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(count); i++)
++			{
++				const char* rawName = zip_get_name(archive, i, 0);
++				if (!rawName)
++					continue;
++				const QString name = QString::fromUtf8(rawName);
++
++				// Jar-in-jar (Fabric: META-INF/jars, Forge/NeoForge: META-INF/jarjar)
++				if (depth == 0 && (name.startsWith("META-INF/jars/") || name.startsWith("META-INF/jarjar/")) && name.endsWith(".jar", Qt::CaseInsensitive))
++				{
++					nestedJars.append(name);
++					continue;
++				}
++
++				if (!name.startsWith("assets/") || name.endsWith('/'))
++					continue;
++
++				const QStringList parts = name.split('/');
++				if (parts.size() < 4)
++					continue;
++				const QString ns = parts[1];
++				const QString type = parts[2];
++				if (ns == "minecraft" || !NamespaceRegex().match(ns).hasMatch())
++					continue;
++				const QString rest = QStringList(parts.mid(3)).join('/');
++
++				if (type == "blockstates" && rest.endsWith(".json"))
++				{
++					QString path = rest.left(rest.size() - 5);
++					if (!ValidPath(path) || path.contains('/'))
++						continue;
++					QString id = ns + ":" + path;
++					if (blockstateData.contains(id))
++						continue;
++					QByteArray data;
++					if (ReadEntry(archive, i, MODWORLD_MAX_JSON_SIZE, data))
++					{
++						blockstateData[id] = data;
++						namespaces.insert(ns);
++					}
++				}
++				else if (type == "models" && rest.endsWith(".json"))
++				{
++					QString path = rest.left(rest.size() - 5);
++					if (!ValidPath(path))
++						continue;
++					QString id = ns + ":" + path;
++					if (modelData.contains(id))
++						continue;
++					QByteArray data;
++					if (ReadEntry(archive, i, MODWORLD_MAX_JSON_SIZE, data))
++						modelData[id] = data;
++				}
++				else if (type == "textures" && rest.endsWith(".png"))
++				{
++					QString path = rest.left(rest.size() - 4);
++					if (!ValidPath(path))
++						continue;
++					QString id = ns + ":" + path;
++					if (!textureRefs.contains(id))
++					{
++						TextureRef ref;
++						ref.archive = archiveIndex;
++						ref.entry = name;
++						textureRefs[id] = ref;
++					}
++				}
++			}
++			zip_close(archive);
++
++			for (const QString& nested : nestedJars)
++			{
++				ArchiveRef nestedRef;
++				nestedRef.jarPath = ref.jarPath;
++				nestedRef.nestedName = nested;
++				nestedRef.modFile = ref.modFile;
++				scanSelf(nestedRef, scanSelf, depth + 1);
++			}
++		};
++
++		for (const QFileInfo& jar : jars)
++		{
++			ArchiveRef ref;
++			ref.jarPath = jar.absoluteFilePath();
++			ref.modFile = jar.fileName();
++			scanArchive(ref, scanArchive, 0);
++		}
++
++		// Parse block states
++		QList<ModBlock> blocks;
++		QStringList skippedBlocks;
++		QStringList blockIds = blockstateData.keys();
++		blockIds.sort();
++		for (const QString& id : blockIds)
++		{
++			ModBlock block;
++			block.id = id;
++			if (!ParseJsonObject(blockstateData[id], block.json))
++			{
++				skippedBlocks.append(id + ": invalid JSON");
++				continue;
++			}
++
++			QJsonValue variants = block.json.value("variants");
++			QJsonValue multipart = block.json.value("multipart");
++			if (variants.isObject())
++			{
++				QJsonObject obj = variants.toObject();
++				for (auto it = obj.begin(); it != obj.end(); ++it)
++				{
++					if (it.key() != "" && it.key() != "normal")
++						for (const QString& pair : it.key().split(','))
++						{
++							int eq = pair.indexOf('=');
++							if (eq > 0)
++								AddStateValue(block, pair.left(eq), pair.mid(eq + 1));
++						}
++					CollectModels(block, it.value());
++				}
++			}
++			else if (multipart.isArray())
++			{
++				QJsonArray cases;
++				for (const QJsonValue& c : multipart.toArray())
++				{
++					QJsonObject mcase = c.toObject();
++					if (mcase.value("when").isObject())
++					{
++						mcase["when"] = NormalizeWhen(mcase.value("when").toObject());
++						CollectWhen(block, mcase.value("when").toObject());
++					}
++					CollectModels(block, mcase.value("apply"));
++					cases.append(mcase);
++				}
++				block.json["multipart"] = cases;
++			}
++			else
++			{
++				skippedBlocks.append(id + ": no variants or multipart (custom loader)");
++				continue;
++			}
++
++			if (block.models.isEmpty())
++			{
++				skippedBlocks.append(id + ": no models");
++				continue;
++			}
++
++			// Multipart often mentions only the true value of a boolean property.
++			// Include false as well so absent connections are not treated as true.
++			for (const QString& s : block.stateOrder)
++			{
++				QStringList& values = block.states[s];
++				if (values.contains("true") && !values.contains("false"))
++					values.prepend("false");
++				else if (values.contains("false") && !values.contains("true"))
++					values.append("true");
++			}
++
++			qint64 stateIds = 1;
++			for (const QString& s : block.stateOrder)
++			{
++				stateIds *= qMax(1, block.states[s].size());
++				if (stateIds > MODWORLD_MAX_STATE_IDS)
++					break;
++			}
++			if (stateIds > MODWORLD_MAX_STATE_IDS)
++			{
++				skippedBlocks.append(id + ": too many block state combinations (" + QString::number(stateIds) + ")");
++				continue;
++			}
++
++			blocks.append(block);
++		}
++
++		// Resolve models and the textures they use
++		QHash<QString, QJsonObject> parsedModels;
++		QSet<QString> visitedModels, missingModels, invalidModels;
++		QSet<QString> usedTextures; // Mine-imator texture list names
++		std::function<void(const QString&, int)> resolveModel = [&](const QString& rawId, int depth)
++		{
++			QString id = NormalizeId(rawId);
++			if (depth > 32 || id.startsWith("minecraft:") || visitedModels.contains(id))
++				return;
++			visitedModels.insert(id);
++			if (!modelData.contains(id))
++			{
++				missingModels.insert(id);
++				return;
++			}
++			QJsonObject model;
++			if (!ParseJsonObject(modelData[id], model))
++			{
++				invalidModels.insert(id);
++				return;
++			}
++			parsedModels[id] = model;
++
++			QJsonValue textures = model.value("textures");
++			auto addTexture = [&](const QJsonValue& v)
++			{
++				QString t = TextureValue(v);
++				if (!t.isEmpty() && !t.startsWith('#'))
++					usedTextures.insert(TextureListName(t));
++			};
++			if (textures.isObject())
++			{
++				QJsonObject obj = textures.toObject();
++				for (auto it = obj.begin(); it != obj.end(); ++it)
++					addTexture(it.value());
++			}
++			else if (textures.isArray())
++				for (const QJsonValue& v : textures.toArray())
++					addTexture(v);
++
++			if (model.value("parent").isString())
++				resolveModel(model.value("parent").toString(), depth + 1);
++		};
++
++		for (const ModBlock& block : blocks)
++			for (const QString& m : block.models)
++				resolveModel(m, 0);
++
++		// Biome tint guess for faces with a tint index
++		QJsonObject textureColors;
++		auto tintForModel = [&](const QString& rawId)
++		{
++			QString id = NormalizeId(rawId);
++			QJsonObject merged;
++			QJsonArray elements;
++			BoolType hasElements = false;
++			QString cur = id;
++			for (int d = 0; d < 32 && parsedModels.contains(cur); d++)
++			{
++				const QJsonObject& m = parsedModels[cur];
++				QJsonObject tex = m.value("textures").toObject();
++				for (auto it = tex.begin(); it != tex.end(); ++it)
++					if (!merged.contains(it.key()))
++						merged[it.key()] = it.value();
++				if (!hasElements && m.value("elements").isArray())
++				{
++					elements = m.value("elements").toArray();
++					hasElements = true;
++				}
++				if (!m.value("parent").isString())
++					break;
++				cur = NormalizeId(m.value("parent").toString());
++			}
++			for (const QJsonValue& e : elements)
++			{
++				QJsonObject faces = e.toObject().value("faces").toObject();
++				for (auto it = faces.begin(); it != faces.end(); ++it)
++				{
++					QJsonObject face = it.value().toObject();
++					if (!face.contains("tintindex"))
++						continue;
++					QString ref = face.value("texture").toString();
++					for (int i = 0; i < 8 && ref.startsWith('#'); i++)
++						ref = TextureValue(merged.value(ref.mid(1)));
++					if (ref.isEmpty() || ref.startsWith('#'))
++						continue;
++					QString name = TextureListName(ref);
++					if (name.contains(':'))
++					{
++						QString category = TintCategory(name);
++						if (!category.isEmpty())
++							textureColors[name] = category;
++					}
++				}
++			}
++		};
++		for (const ModBlock& block : blocks)
++			for (const QString& m : block.models)
++				tintForModel(m);
++
++		// Pass 2: extract and normalize the used mod textures
++		QHash<int, QStringList> texturesByArchive;
++		QStringList missingTextures;
++		for (const QString& name : usedTextures)
++		{
++			if (!name.contains(':'))
++				continue; // Vanilla texture
++			if (!textureRefs.contains(name))
++			{
++				missingTextures.append(name);
++				continue;
++			}
++			texturesByArchive[textureRefs[name].archive].append(name);
++		}
++
++		QSet<QString> writtenTextures;
++		for (auto it = texturesByArchive.begin(); it != texturesByArchive.end(); ++it)
++		{
++			QByteArray holder;
++			zip_t* archive = OpenArchive(archives[it.key()], holder);
++			if (!archive)
++				continue;
++			for (const QString& name : it.value())
++			{
++				const TextureRef& ref = textureRefs[name];
++				zip_int64_t index = zip_name_locate(archive, ref.entry.toUtf8().constData(), 0);
++				QByteArray data;
++				QImage img;
++				if (index < 0 || !ReadEntry(archive, static_cast<zip_uint64_t>(index), MODWORLD_MAX_PNG_SIZE, data) ||
++					!img.loadFromData(data, "PNG") || (img = NormalizeTexture(img)).isNull())
++				{
++					missingTextures.append(name + " (unreadable)");
++					continue;
++				}
++				int colon = name.indexOf(':');
++				QString out = cachePath + "/assets/" + name.left(colon) + "/textures/" + name.mid(colon + 1) + ".png";
++				QDir().mkpath(QFileInfo(out).absolutePath());
++				if (img.save(out, "PNG"))
++					writtenTextures.insert(name);
++			}
++			zip_close(archive);
++		}
++
++		// Write block states and models
++		auto pathFor = [&](const QString& id, const QString& type)
++		{
++			int colon = id.indexOf(':');
++			return cachePath + "/assets/" + id.left(colon) + "/" + type + "/" + id.mid(colon + 1) + ".json";
++		};
++
++		for (auto it = parsedModels.begin(); it != parsedModels.end(); ++it)
++			WriteFile(pathFor(it.key(), "models"), QJsonDocument(it.value()).toJson(QJsonDocument::Compact));
++
++		QJsonArray blockArray;
++		for (const ModBlock& block : blocks)
++		{
++			if (!WriteFile(pathFor(block.id, "blockstates"), QJsonDocument(block.json).toJson(QJsonDocument::Compact)))
++			{
++				skippedBlocks.append(block.id + ": cannot write cache file");
++				continue;
++			}
++			QJsonObject entry;
++			entry["name"] = block.id;
++			entry["id"] = block.id;
++			entry["file"] = block.id;
++			if (!block.stateOrder.isEmpty())
++			{
++				QJsonObject states;
++				for (const QString& s : block.stateOrder)
++					states[s] = QJsonArray::fromStringList(block.states[s]);
++				entry["states"] = states;
++			}
++			blockArray.append(entry);
++		}
++
++		// Placeholder for blocks without usable assets
++		{
++			QImage missing(MODWORLD_TEXTURE_SIZE, MODWORLD_TEXTURE_SIZE, QImage::Format_ARGB32);
++			for (int y = 0; y < MODWORLD_TEXTURE_SIZE; y++)
++				for (int x = 0; x < MODWORLD_TEXTURE_SIZE; x++)
++					missing.setPixel(x, y, ((x / 8 + y / 8) % 2) ? qRgb(248, 0, 248) : qRgb(16, 16, 16));
++			QString ns = MODWORLD_PLACEHOLDER_NS;
++			QDir().mkpath(cachePath + "/assets/" + ns + "/textures/block");
++			missing.save(cachePath + "/assets/" + ns + "/textures/block/unknown_block.png", "PNG");
++			WriteFile(cachePath + "/assets/" + ns + "/models/block/unknown_block.json",
++				"{\"parent\":\"minecraft:block/cube_all\",\"textures\":{\"all\":\"" MODWORLD_PLACEHOLDER_NS ":block/unknown_block\"}}");
++			WriteFile(cachePath + "/assets/" + ns + "/blockstates/unknown_block.json",
++				"{\"variants\":{\"\":{\"model\":\"" MODWORLD_PLACEHOLDER_NS ":block/unknown_block\"}}}");
++			QJsonObject entry;
++			entry["name"] = MODWORLD_PLACEHOLDER_ID;
++			entry["id"] = MODWORLD_PLACEHOLDER_ID;
++			entry["file"] = MODWORLD_PLACEHOLDER_ID;
++			blockArray.append(entry);
++			writtenTextures.insert(MODWORLD_PLACEHOLDER_NS ":block/unknown_block");
++		}
++
++		// Texture list: mod textures that exist + vanilla textures referenced by mod models
++		QStringList textureList;
++		for (const QString& name : usedTextures)
++			if (!name.contains(':'))
++				textureList.append(name);
++		for (const QString& name : writtenTextures)
++			textureList.append(name);
++		textureList.sort();
++
++		QJsonObject manifest;
++		manifest["format"] = MODWORLD_CACHE_FORMAT;
++		manifest["instance"] = instancePath;
++		manifest["mods"] = jars.size();
++		manifest["placeholder"] = MODWORLD_PLACEHOLDER_ID;
++		manifest["blocks"] = blockArray;
++		manifest["block_textures"] = QJsonArray::fromStringList(textureList);
++		manifest["block_textures_color"] = textureColors;
++
++		// Report
++		report << "Mine-imator mod asset cache";
++		report << "Instance: " + instancePath;
++		report << "Mod JAR files: " + QString::number(jars.size()) + " (archives incl. nested: " + QString::number(archives.size()) + ")";
++		report << "Namespaces with block states: " + QString::number(namespaces.size());
++		report << "Blocks prepared: " + QString::number(blocks.size());
++		report << "Blocks skipped: " + QString::number(skippedBlocks.size());
++		report << "Models prepared: " + QString::number(parsedModels.size());
++		report << "Mod textures prepared: " + QString::number(writtenTextures.size() - 1);
++		report << "Missing models: " + QString::number(missingModels.size() + invalidModels.size());
++		report << "Missing textures: " + QString::number(missingTextures.size());
++		report << "Time: " + QString::number(timer.Elapsed()) + " s";
++		auto section = [&](const QString& title, QStringList list)
++		{
++			if (list.isEmpty())
++				return;
++			list.sort();
++			report << "" << title + ":";
++			for (int i = 0; i < list.size() && i < 2000; i++)
++				report << "  " + list[i];
++			if (list.size() > 2000)
++				report << "  ... " + QString::number(list.size() - 2000) + " more";
++		};
++		section("Archive errors", archiveErrors);
++		section("Skipped blocks", skippedBlocks);
++		section("Missing models", QStringList(missingModels.values()));
++		section("Invalid model JSON", QStringList(invalidModels.values()));
++		section("Missing textures", missingTextures);
++
++		WriteFile(reportPath, report.join("\n").toUtf8() + "\n");
++		if (!WriteFile(manifestPath, QJsonDocument(manifest).toJson(QJsonDocument::Compact)))
++			return "";
++		WriteFile(signaturePath, signatureHash + "\n");
++
++		DEBUG("Mod asset cache ready: " + NumStr(blocks.size()) + " blocks, " + NumStr(writtenTextures.size()) + " textures");
++		return manifestPath;
++	}
++}
+diff --git a/CppProject/World/NBT.cpp b/CppProject/World/NBT.cpp
+index 346f2b9..7174652 100644
+--- a/CppProject/World/NBT.cpp
++++ b/CppProject/World/NBT.cpp
+@@ -116,21 +116,18 @@ namespace CppProject
+ 
+ 	StringType NbtStream::ReadString()
+ 	{
+-		int16_t len;
++		uint16_t len;
+ 		ds >> len;
+-		if (stringSkipMc && len > MINECRAFT_ID_LENGTH)
+-		{
+-			ds.skipRawData(MINECRAFT_ID_LENGTH);
+-			len -= MINECRAFT_ID_LENGTH;
+-		}
+ 
+-		char* str = new char[len + 1];
+-		ds.readRawData(str, len);
+-		str[len] = '\0';
+-		QString qStr(str);
+-		delete[] str;
++		QByteArray bytes(len, Qt::Uninitialized);
++		if (len > 0 && ds.readRawData(bytes.data(), len) != len)
++			throw QString("Unexpected end of NBT string");
++
++		// Only remove an actual "minecraft:" prefix, mod IDs keep their namespace
++		if (stringSkipMc && len > MINECRAFT_ID_LENGTH && bytes.startsWith("minecraft:"))
++			bytes.remove(0, MINECRAFT_ID_LENGTH);
+ 
+-		return qStr;
++		return QString::fromUtf8(bytes);
+ 	}
+ 
+ 	void NbtStream::SkipString()
+diff --git a/CppProject/World/Preview.cpp b/CppProject/World/Preview.cpp
+index d87457d..fe43e0e 100644
+--- a/CppProject/World/Preview.cpp
++++ b/CppProject/World/Preview.cpp
+@@ -102,6 +102,7 @@ namespace CppProject
+ 		Region::loader->disconnect();
+ 		Region::loader->active = false;
+ 		World::GenerateBuilderSections(selection);
++		World::SaveUnknownBlocksReport();
+ 
+ 		ArrType filterArray;
+ 		if (global::_app->setting_world_import_filter_enabled)
+diff --git a/CppProject/World/Section.cpp b/CppProject/World/Section.cpp
+index 93240b8..1954f06 100644
+--- a/CppProject/World/Section.cpp
++++ b/CppProject/World/Section.cpp
+@@ -297,7 +297,7 @@ namespace CppProject
+ 
+ 					preview.hasBlocks = true;
+ 					blockStylePalette.Append({
+-						Preview::filteredMcBlockIdStyleIndexMap.value(id),
++						World::FindPreviewStyle(id),
+ 						(waterlogged || World::filteredMcBlockIdWaterloggedMap.value(id, false))
+ 					});
+ 				}
+@@ -405,7 +405,7 @@ namespace CppProject
+ 				StringType id = entry->String("Name");
+ 				if (id != "air") // Non air
+ 				{
+-					if (obj_block* block = Builder::filteredMcBlockIdObjMap.value(id, nullptr))
++					if (obj_block* block = World::FindBuilderBlock(id))
+ 					{
+ 						BuilderState state = { (uint16_t)block->block_id, 0, World::filteredMcBlockIdWaterloggedMap.value(id, false) };
+ 						ArrType vars = Builder::mcBlockIdStateVarsMap.value(id, ArrType());
+diff --git a/CppProject/World/World.cpp b/CppProject/World/World.cpp
+index 0d875af..3a1e28e 100644
+--- a/CppProject/World/World.cpp
++++ b/CppProject/World/World.cpp
+@@ -18,6 +18,72 @@ namespace CppProject
+ 	QHash<QString, SaveInfo> World::saves;
+ 	QHash<StringType, BoolType> World::mcBlockIdWaterloggedMap, World::filteredMcBlockIdWaterloggedMap;
+ 	BoolType World::waterRemoved = false;
++	obj_block* World::modPlaceholderBlock = nullptr;
++	uint16_t World::modPlaceholderStyle = 0;
++	BoolType World::modPlaceholderActive = false;
++	QString World::modCacheDir;
++	QSet<QString> World::unknownModBlocks;
++	QMutex World::unknownModBlocksMutex;
++
++	static const char* modPlaceholderId = "mineimator_missing:unknown_block";
++
++	static void RecordUnknownModBlock(const StringType& id)
++	{
++		QMutexLocker lock(&World::unknownModBlocksMutex);
++		if (World::unknownModBlocks.size() < 100000)
++			World::unknownModBlocks.insert(id.QStr());
++	}
++
++	obj_block* World::FindBuilderBlock(const StringType& id)
++	{
++		auto it = Builder::filteredMcBlockIdObjMap.constFind(id);
++		if (it != Builder::filteredMcBlockIdObjMap.constEnd())
++			return it.value();
++
++		// Vanilla IDs have "minecraft:" removed, so a colon means a mod block
++		if (modPlaceholderActive && id.Contains(":") && !Builder::mcBlockIdObjMap.contains(id))
++		{
++			RecordUnknownModBlock(id);
++			return modPlaceholderBlock;
++		}
++		return nullptr;
++	}
++
++	uint16_t World::FindPreviewStyle(const StringType& id)
++	{
++		auto it = Preview::filteredMcBlockIdStyleIndexMap.constFind(id);
++		if (it != Preview::filteredMcBlockIdStyleIndexMap.constEnd())
++			return it.value();
++
++		if (modPlaceholderActive && id.Contains(":") && !Preview::mcBlockIdStyleIndexMap.contains(id))
++		{
++			RecordUnknownModBlock(id);
++			return modPlaceholderStyle;
++		}
++		return 0;
++	}
++
++	void World::SaveUnknownBlocksReport()
++	{
++		QStringList ids;
++		{
++			QMutexLocker lock(&unknownModBlocksMutex);
++			ids = QStringList(unknownModBlocks.values());
++		}
++		if (modCacheDir.isEmpty() || ids.isEmpty())
++			return;
++
++		ids.sort();
++		QFile file(modCacheDir + "/unknown_blocks.txt");
++		if (file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
++		{
++			QByteArray text = "Mod blocks found in imported worlds without usable assets (shown as a magenta/black placeholder):\n";
++			for (const QString& id : ids)
++				text += "  " + id.toUtf8() + "\n";
++			file.write(text);
++		}
++		WARNING(NumStr(ids.size()) + " mod block IDs had no assets, see " + modCacheDir + "/unknown_blocks.txt");
++	}
+ 
+ 	void World::Init()
+ 	{
+@@ -159,6 +225,12 @@ namespace CppProject
+ 		Builder::mcBlockIdObjMap["grass_path"] = Builder::mcBlockIdObjMap["dirt_path"];
+ 		Preview::mcBlockIdStyleIndexMap["grass_path"] = Preview::mcBlockIdStyleIndexMap["dirt_path"];
+ 
++		// Placeholder for mod blocks without assets (only exists when mod assets were loaded)
++		modPlaceholderBlock = Builder::mcBlockIdObjMap.value(modPlaceholderId, nullptr);
++		modPlaceholderStyle = Preview::mcBlockIdStyleIndexMap.value(modPlaceholderId, 0);
++		if (modPlaceholderBlock)
++			DEBUG("Mod block placeholder available");
++
+ 		// Apply current filter
+ 		ApplyFilter();
+ 
+@@ -388,6 +460,25 @@ namespace CppProject
+ 		if (endDir.exists() && !endDir.isEmpty())
+ 			info.dimDir["the_end"] = endDir;
+ 
++		// Mod dimensions: dimensions/<namespace>/<name>/region, stored as "namespace:name"
++		QDir allDimensionsDir(dir + "/dimensions");
++		if (allDimensionsDir.exists())
++		{
++			for (const QString& ns : allDimensionsDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name))
++			{
++				QDir nsDir(allDimensionsDir.filePath(ns));
++				for (const QString& name : nsDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name))
++				{
++					if (ns == "minecraft" && (name == "overworld" || name == "the_nether" || name == "the_end"))
++						continue;
++
++					QDir regionDir(nsDir.filePath(name) + "/region", filter);
++					if (regionDir.exists() && !regionDir.isEmpty())
++						info.dimDir[ns + ":" + name] = regionDir;
++				}
++			}
++		}
++
+ 		World::saves[dir] = info;
+ 		return true;
+ 	}
+@@ -454,6 +545,9 @@ namespace CppProject
+ 			changed = true;
+ 		}
+ 
++		// Placeholder for unknown mod blocks, not used when only kept blocks are imported
++		modPlaceholderActive = (modPlaceholderBlock != nullptr && !(filterEnabled && filterMode == KEEP));
++
+ 		// Update waterlogged map (empty if water is removed)
+ 		if (World::waterRemoved)
+ 			filteredMcBlockIdWaterloggedMap.clear();
+diff --git a/CppProject/World/World.hpp b/CppProject/World/World.hpp
+index 74eaeb6..746fc76 100644
+--- a/CppProject/World/World.hpp
++++ b/CppProject/World/World.hpp
+@@ -3,6 +3,9 @@
+ #include "FastVector.hpp"
+ #include "Render/Mesh.hpp"
+ 
++#include <QMutex>
++#include <QSet>
++
+ #define PREVIEW_ZNEAR 1.0
+ #define PREVIEW_ZFAR 10000.0
+ #define PREVIEW_ZOOM_MIN 1.0
+@@ -208,6 +211,21 @@ namespace CppProject
+ 		static QHash<QString, SaveInfo> saves;
+ 		static QHash<StringType, BoolType> mcBlockIdWaterloggedMap, filteredMcBlockIdWaterloggedMap;
+ 		static BoolType waterRemoved;
++
++		// Modded worlds: block used for namespaced IDs without assets (magenta/black cube).
++		static obj_block* modPlaceholderBlock;
++		static uint16_t modPlaceholderStyle;
++		static BoolType modPlaceholderActive;
++		static QString modCacheDir;
++		static QSet<QString> unknownModBlocks;
++		static QMutex unknownModBlocksMutex;
++
++		// Thread-safe lookups of the filtered maps with the placeholder fallback.
++		static obj_block* FindBuilderBlock(const StringType& id);
++		static uint16_t FindPreviewStyle(const StringType& id);
++
++		// Writes the namespaced block IDs that had no assets to the mod cache folder.
++		static void SaveUnknownBlocksReport();
+ 	};
+ 
+ 	// 3D preview viewport
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index 6a8b7ea..5512301 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -2109,7 +2109,7 @@
+ 		}
+ 	},
+ 	"worldimport/": {
+-		"instancetip": "Choose Minecraft instance folder (experimental; mod blocks not loaded)",
++		"instancetip": "Choose Minecraft instance folder (worlds and mod blocks)",
+ 		"noworld": "No world selected",
+ 		"world": "World",
+ 		"error": "There was an issue loading the world. It may be corrupted or created in an unsupported version of Minecraft.",
+diff --git a/GmProject/datafiles/Data/Languages/german.milanguage b/GmProject/datafiles/Data/Languages/german.milanguage
+index 345ae30..aa048f5 100644
+--- a/GmProject/datafiles/Data/Languages/german.milanguage
++++ b/GmProject/datafiles/Data/Languages/german.milanguage
+@@ -2094,7 +2094,7 @@
+ 		}
+ 	},
+ 	"worldimport/": {
+-		"instancetip": "Minecraft-Instanzordner wählen (experimentell; Mod-Blöcke werden nicht geladen)",
++		"instancetip": "Minecraft-Instanzordner wählen (Welten und Mod-Blöcke)",
+ 		"noworld": "Keine Welt ausgewählt",
+ 		"world": "Welt",
+ 		"error": "Beim Laden der Welt ist ein Problem aufgetreten. Sie ist möglicherweise beschädigt oder wurde in einer nicht unterstützten Version von Minecraft erstellt.",
+diff --git a/GmProject/scripts/block_load/block_load.gml b/GmProject/scripts/block_load/block_load.gml
+index 4c75514..e4ceeeb 100644
+--- a/GmProject/scripts/block_load/block_load.gml
++++ b/GmProject/scripts/block_load/block_load.gml
+@@ -170,7 +170,7 @@ function block_load(map, typemap)
+ 		
+ 		// Load default file
+ 		if (filename != "")
+-			file = block_load_state_file(load_assets_dir + mc_blockstates_directory + filename, id, array())
++			file = block_load_state_file(modworld_state_file_path(filename), id, array())
+ 		else
+ 			file = null
+ 		
+@@ -284,7 +284,7 @@ function block_load(map, typemap)
+ 						if (value_filename[valid] != "")
+ 						{
+ 							if (value_file[valid] = null)
+-								value_file[valid] = block_load_state_file(load_assets_dir + mc_blockstates_directory + value_filename[valid], other.id, array(name, value_name[valid]))
++								value_file[valid] = block_load_state_file(modworld_state_file_path(value_filename[valid]), other.id, array(name, value_name[valid]))
+ 							curfile = value_file[valid]
+ 						}
+ 						
+@@ -310,6 +310,8 @@ function block_load(map, typemap)
+ 				var variant = state_id_map[?sid];
+ 				if (is_undefined(variant))
+ 					variant = state_id_map[?0] // Only "normal" is available
++				if (is_undefined(variant) && string_pos(":", other.filename) > 0 && !is_array(state_id_map[?state_default_variant_id]))
++					variant = state_id_map[?state_default_variant_id] // Mod block (variants) with an unlisted state, use first variant
+ 				
+ 				other.state_id_model_obj[sid] = variant
+ 				other.state_id_emissive[sid] = curemissive
+diff --git a/GmProject/scripts/block_load_model_file/block_load_model_file.gml b/GmProject/scripts/block_load_model_file/block_load_model_file.gml
+index cf0e3cd..de0bdd5 100644
+--- a/GmProject/scripts/block_load_model_file/block_load_model_file.gml
++++ b/GmProject/scripts/block_load_model_file/block_load_model_file.gml
+@@ -4,8 +4,8 @@
+ 
+ function block_load_model_file(fname, res = null)
+ {
+-	if (res = null && !is_undefined(load_assets_model_file_map[?filename_name(fname)])) // Previously loaded
+-		return load_assets_model_file_map[?filename_name(fname)]
++	if (res = null && !is_undefined(load_assets_model_file_map[?modworld_model_cache_key(fname)])) // Previously loaded
++		return load_assets_model_file_map[?modworld_model_cache_key(fname)]
+ 	
+ 	if (!file_exists_lib(fname))
+ 	{
+@@ -30,7 +30,7 @@ function block_load_model_file(fname, res = null)
+ 		// Parent
+ 		parent = null
+ 		if (res = null && is_string(map[?"parent"]))
+-			parent = block_load_model_file(load_assets_dir + mc_models_directory + string_replace(map[?"parent"], "minecraft:", "") + ".json")
++			parent = block_load_model_file(modworld_model_file_path(string_replace(map[?"parent"], "minecraft:", "")))
+ 		
+ 		// Textures
+ 		texture_map = null
+@@ -226,7 +226,7 @@ function block_load_model_file(fname, res = null)
+ 		}
+ 		
+ 		if (res = null)
+-			load_assets_model_file_map[?filename_name(fname)] = id
++			load_assets_model_file_map[?modworld_model_cache_key(fname)] = id
+ 		
+ 		ds_map_destroy(map)
+ 		
+diff --git a/GmProject/scripts/block_load_state_file/block_load_state_file.gml b/GmProject/scripts/block_load_state_file/block_load_state_file.gml
+index 7e94083..c894640 100644
+--- a/GmProject/scripts/block_load_state_file/block_load_state_file.gml
++++ b/GmProject/scripts/block_load_state_file/block_load_state_file.gml
+@@ -45,7 +45,7 @@ function block_load_state_file(fname, block, state)
+ 		model_preview_alpha_yp = -1
+ 		
+ 		// Read colors from assets for block JSON (used to modify undesired block colors/alpha)
+-		if (ds_map_valid(mc_assets.block_texture_preview_map[?name]))
++		if (!modworld_is_mod_file(fname) && ds_map_valid(mc_assets.block_texture_preview_map[?name]))
+ 		{
+ 			var blockmap = mc_assets.block_texture_preview_map[?name];
+ 			
+diff --git a/GmProject/scripts/block_load_variant_model/block_load_variant_model.gml b/GmProject/scripts/block_load_variant_model/block_load_variant_model.gml
+index 9ebe437..d1bb63d 100644
+--- a/GmProject/scripts/block_load_variant_model/block_load_variant_model.gml
++++ b/GmProject/scripts/block_load_variant_model/block_load_variant_model.gml
+@@ -12,7 +12,7 @@ function block_load_variant_model(map, type)
+ 	// Model
+ 	var blockname, blockmodel;
+ 	blockname = string_replace(map[?"model"], "minecraft:", "")
+-	blockmodel = block_load_model_file(load_assets_dir + mc_models_directory + blockname + ".json")
++	blockmodel = block_load_model_file(modworld_model_file_path(blockname))
+ 	
+ 	if (!blockmodel)
+ 		return false
+diff --git a/GmProject/scripts/minecraft_assets_load/minecraft_assets_load.gml b/GmProject/scripts/minecraft_assets_load/minecraft_assets_load.gml
+index e5520d9..9ef8d44 100644
+--- a/GmProject/scripts/minecraft_assets_load/minecraft_assets_load.gml
++++ b/GmProject/scripts/minecraft_assets_load/minecraft_assets_load.gml
+@@ -35,12 +35,21 @@ function minecraft_assets_load()
+ 				else
+ 					log("Archive already unzipped, re-using", load_assets_dir + mc_assets_directory)
+ 				
+-				load_assets_stage = "biomes"
++				load_assets_stage = "mods"
+ 				load_assets_progress = 0.3
+ 				file_copy_temp = false
+ 				break
+ 			}
+ 			
++			// Prepare the block assets of the mods in the chosen Minecraft instance
++			case "mods":
++			{
++				modworld_load_manifest()
++				load_assets_stage = "biomes"
++				load_assets_progress = 0.35
++				break
++			}
++
+ 			// Load biomes
+ 			case "biomes":
+ 			{
+@@ -196,6 +205,9 @@ function minecraft_assets_load()
+ 				
+ 				ds_list_copy(particle_texture_list, particletextureslist)
+ 				
++				// Add mod block textures (extends the block sheet)
++				modworld_add_textures()
++
+ 				// Create sheets and texture depth
+ 				with (mc_res)
+ 				{
+@@ -405,6 +417,14 @@ function minecraft_assets_load()
+ 				{
+ 					if (load_assets_block_index = ds_list_size(blockslist))
+ 					{
++						// Mod blocks are loaded after all Minecraft blocks
++						if (mod_assets_block_index < mod_assets_block_amount)
++						{
++							modworld_load_block(mod_assets_block_index)
++							mod_assets_block_index++
++							continue
++						}
++
+ 						load_assets_stage = "done"
+ 						break
+ 					}
+@@ -426,7 +446,7 @@ function minecraft_assets_load()
+ 					load_assets_block_index++
+ 				}
+ 				
+-				load_assets_progress = 0.6 + 0.4 * (load_assets_block_index / ds_list_size(blockslist))
++				load_assets_progress = 0.6 + 0.4 * ((load_assets_block_index + mod_assets_block_index) / max(1, ds_list_size(blockslist) + mod_assets_block_amount))
+ 				
+ 				if (dev_mode_skip_blocks)
+ 					load_assets_stage = "done"
+@@ -550,6 +570,9 @@ function minecraft_assets_load()
+ 					
+ 					file_copy_temp = !is_cpp()
+ 					
++					// Mod blocks done
++					modworld_load_done()
++
+ 					ds_map_destroy(load_assets_state_file_map)
+ 					ds_map_destroy(load_assets_model_file_map)
+ 					ds_map_destroy(load_assets_map)
+diff --git a/GmProject/scripts/minecraft_assets_load_startup/minecraft_assets_load_startup.gml b/GmProject/scripts/minecraft_assets_load_startup/minecraft_assets_load_startup.gml
+index 7afadf8..f009d4c 100644
+--- a/GmProject/scripts/minecraft_assets_load_startup/minecraft_assets_load_startup.gml
++++ b/GmProject/scripts/minecraft_assets_load_startup/minecraft_assets_load_startup.gml
+@@ -9,6 +9,7 @@ function minecraft_assets_load_startup()
+ 	globalvar load_assets_startup_dir, load_assets_dir, load_assets_file, load_assets_zip_file, load_assets_state_file_map, load_assets_model_file_map, load_assets_map, load_assets_type_map;
+ 	globalvar load_assets_block_preview_buffer, load_assets_block_preview_ani_buffer;
+ 	globalvar pattern_update, armor_update;
++	globalvar mod_assets_dir, mod_assets_instance, mod_assets_map, mod_assets_type_map, mod_assets_block_index, mod_assets_block_amount, mod_assets_base_sheet_height;
+ 	
+ 	mc_assets = new_obj(obj_minecraft_assets)
+ 	mc_builder = new_obj(obj_builder)
+@@ -20,6 +21,15 @@ function minecraft_assets_load_startup()
+ 	load_assets_map = null
+ 	load_assets_type_map = null
+ 	load_assets_block_index = 0
++
++	// Mod blocks of the Minecraft instance chosen in the world importer
++	mod_assets_dir = ""
++	mod_assets_instance = ""
++	mod_assets_map = null
++	mod_assets_type_map = null
++	mod_assets_block_index = 0
++	mod_assets_block_amount = 0
++	mod_assets_base_sheet_height = 0
+ 	window_set_size(740, 450)
+ 	alarm[0] = 1
+ 	
+diff --git a/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml b/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
+index 33ac4dd..8304f68 100644
+--- a/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
++++ b/GmProject/scripts/res_load_pack_block_sheet/res_load_pack_block_sheet.gml
+@@ -28,7 +28,7 @@ function res_load_pack_block_sheet(type, suffix)
+ 		name = string_replace(mc_assets.block_texture_list[|t], " opaque", "")
+ 		name = string_replace(name, " nocull", "")
+ 		name = string_replace(name, " noalpha", "")
+-		fname = load_assets_dir + mc_textures_directory + name + suffix + ".png"
++		fname = modworld_texture_file_path(name, suffix)
+ 		
+ 		// Look if legacy name exists
+ 		if (!file_exists_lib(fname) && !is_undefined(legacy_block_texture_name_map[?name]))
+diff --git a/GmProject/scripts/settings_load/settings_load.gml b/GmProject/scripts/settings_load/settings_load.gml
+index 06a1166..c5ebe71 100644
+--- a/GmProject/scripts/settings_load/settings_load.gml
++++ b/GmProject/scripts/settings_load/settings_load.gml
+@@ -283,6 +283,7 @@ function settings_load()
+ 			setting_world_import_filter_mode = value_get_real(worldimportmap[?"filter_mode"], setting_world_import_filter_mode)
+ 			ds_list_merge(setting_world_import_filter_list, worldimportmap[?"filter_list"])
+ 			setting_world_import_unload_regions = value_get_real(worldimportmap[?"unload_regions"], setting_world_import_unload_regions)
++			setting_world_import_instance = value_get_string(worldimportmap[?"instance"], setting_world_import_instance)
+ 		}
+ 	}
+ 	
+diff --git a/GmProject/scripts/settings_save/settings_save.gml b/GmProject/scripts/settings_save/settings_save.gml
+index 5f9c15f..2778e99 100644
+--- a/GmProject/scripts/settings_save/settings_save.gml
++++ b/GmProject/scripts/settings_save/settings_save.gml
+@@ -238,6 +238,7 @@ function settings_save()
+ 				json_save_array_value(setting_world_import_filter_list[|i])
+ 		json_save_array_done()
+ 		json_save_var_bool("unload_regions", setting_world_import_unload_regions)
++		json_save_var("instance", json_string_encode(setting_world_import_instance))
+ 		
+ 	json_save_object_done()
+ 	
+diff --git a/GmProject/scripts/settings_startup/settings_startup.gml b/GmProject/scripts/settings_startup/settings_startup.gml
+index e17130f..65451d7 100644
+--- a/GmProject/scripts/settings_startup/settings_startup.gml
++++ b/GmProject/scripts/settings_startup/settings_startup.gml
+@@ -138,6 +138,7 @@ function settings_startup()
+ 	setting_world_import_filter_mode = 0
+ 	setting_world_import_filter_list = ds_list_create()
+ 	setting_world_import_unload_regions = true
++	setting_world_import_instance = "" // Minecraft instance folder with saves/mods, "" = default .minecraft
+ 	
+ 	// Viewport
+ 	setting_snap = false
+diff --git a/GmProject/scripts/world_import/world_import.gml b/GmProject/scripts/world_import/world_import.gml
+index 1fc55e1..6fa6b37 100644
+--- a/GmProject/scripts/world_import/world_import.gml
++++ b/GmProject/scripts/world_import/world_import.gml
+@@ -24,6 +24,7 @@ function app_startup_interface_world_import()
+ 	for (var i = 0; i < ds_list_size(setting_world_import_filter_list); i++) // Add indices from filter list
+ 		sortlist_add(world_import_settings_filter_list, setting_world_import_filter_list[|i])
+ 	
++	world_import_set_instance(setting_world_import_instance)
+ 	world_import_startup()
+ }
+ 
+@@ -66,10 +67,259 @@ function world_import_has_dimension(name)
+ 	return true
+ }
+ 
+-/// CppSeparate void world_import_choose_instance()
+-/// Choose an instance for the world list. Mod blocks are not yet loaded.
+-function world_import_choose_instance()
++/// CppSeparate StringType world_import_choose_instance(StringType)
++/// Asks for a Minecraft instance folder. Returns the folder, "<default>" for the default .minecraft, or "" when cancelled.
++function world_import_choose_instance(loadedinstance)
+ {
++	return ""
++}
++
++/// CppSeparate void world_import_set_instance(StringType)
++/// Sets the Minecraft instance folder used for the world list ("" = default .minecraft).
++function world_import_set_instance(folder)
++{
++}
++
++/// CppSeparate void world_import_dimension_menu_add_mods()
++/// Adds the mod dimensions of the current world to the menu list.
++function world_import_dimension_menu_add_mods()
++{
++}
++
++/// Chooses the Minecraft instance folder and stores it in the settings.
++function world_import_choose_instance_folder()
++{
++	var folder = world_import_choose_instance(mod_assets_instance);
++	if (folder = "")
++		return 0
++
++	app.setting_world_import_instance = (folder = "<default>" ? "" : folder)
++	world_import_set_instance(app.setting_world_import_instance)
++	settings_save()
++}
++
++/// Returns the display name of a dimension. Mod dimensions show their ID.
++function world_import_dimension_name(dim)
++{
++	if (string_pos(":", dim) > 0)
++		return dim
++
++	return text_get("worldimport" + string_replace_all(dim, "_", ""))
++}
++
++/// CppSeparate StringType modworld_prepare_assets(StringType, StringType)
++/// Builds or re-uses the cache of mod block assets, returns the manifest file.
++function modworld_prepare_assets(instance, cachedir)
++{
++	return ""
++}
++
++/// CppSeparate void modworld_set_cache_dir(StringType)
++function modworld_set_cache_dir(dir)
++{
++}
++
++/// CppSeparate void modworld_set_sheet_info(IntType, IntType, IntType)
++/// Block sheet size, used to validate cached scenery meshes.
++function modworld_set_sheet_info(width, height, baseheight)
++{
++}
++
++/// Loads the mod block manifest of the chosen Minecraft instance (on startup).
++function modworld_load_manifest()
++{
++	var instance = app.setting_world_import_instance;
++	if (!is_string(instance) || instance = "")
++		return false
++
++	if (!directory_exists_lib(instance))
++	{
++		log("Minecraft instance folder not found, mod blocks not loaded", instance)
++		return false
++	}
++
++	var cachedir, manifest;
++	cachedir = file_directory + "Minecraft_mods/"
++	manifest = modworld_prepare_assets(instance, cachedir)
++	if (manifest = "" || !file_exists_lib(manifest))
++	{
++		log("Could not prepare mod blocks", instance)
++		return false
++	}
++
++	mod_assets_type_map = ds_int_map_create()
++	mod_assets_map = json_load(manifest, mod_assets_type_map)
++	if (!ds_map_valid(mod_assets_map) || !ds_list_valid(mod_assets_map[?"blocks"]))
++	{
++		log("Could not parse mod block manifest", manifest)
++		if (ds_map_valid(mod_assets_map))
++			ds_map_destroy(mod_assets_map)
++		ds_map_destroy(mod_assets_type_map)
++		mod_assets_map = null
++		mod_assets_type_map = null
++		return false
++	}
++
++	mod_assets_dir = cachedir
++	mod_assets_instance = instance
++	mod_assets_block_amount = ds_list_size(mod_assets_map[?"blocks"])
++	modworld_set_cache_dir(cachedir)
++	log("Mod blocks to load", mod_assets_block_amount)
++
++	return true
++}
++
++/// Adds the textures used by mod blocks to the block sheet and grows the sheet.
++function modworld_add_textures()
++{
++	mod_assets_base_sheet_height = minecraft_block_sheet_size[1]
++
++	if (mod_assets_map = null)
++		return 0
++
++	var texlist, maxslots, added;
++	texlist = mod_assets_map[?"block_textures"]
++	maxslots = minecraft_block_sheet_size[0] * 512 // Keep the sheet below 8192 pixels at 16x16
++	added = 0
++
++	if (ds_list_valid(texlist))
++	{
++		for (var i = 0; i < ds_list_size(texlist); i++)
++		{
++			var name = texlist[|i];
++			if (!is_string(name))
++				continue
++
++			if (ds_list_find_index(mc_assets.block_texture_list, name) > -1 || ds_list_find_index(mc_assets.block_texture_ani_list, name) > -1)
++				continue
++
++			if (!file_exists_lib(modworld_texture_file_path(name, "")))
++				continue
++
++			if (ds_list_size(mc_assets.block_texture_list) >= maxslots)
++			{
++				log("Too many mod block textures, skipped", ds_list_size(texlist) - i)
++				break
++			}
++
++			ds_list_add(mc_assets.block_texture_list, name)
++			added++
++		}
++	}
++
++	// Biome tinted mod textures
++	var colormap = mod_assets_map[?"block_textures_color"];
++	if (ds_map_valid(colormap))
++	{
++		var key = ds_map_find_first(colormap);
++		while (!is_undefined(key))
++		{
++			if (is_undefined(mc_assets.block_texture_color_map[?key]))
++				mc_assets.block_texture_color_map[?key] = colormap[?key]
++			key = ds_map_find_next(colormap, key)
++		}
++	}
++
++	minecraft_block_sheet_size[1] = max(minecraft_block_sheet_size[1], ceil(ds_list_size(mc_assets.block_texture_list) / minecraft_block_sheet_size[0]))
++	log("Mod block textures added", added, "block sheet rows", minecraft_block_sheet_size[1])
++
++	return added
++}
++
++/// Loads mod block number "index" from the manifest.
++function modworld_load_block(index)
++{
++	var blocks, blockmap, block;
++	blocks = mod_assets_map[?"blocks"]
++	blockmap = blocks[|index]
++	if (!ds_map_valid(blockmap))
++		return null
++
++	block = block_load(blockmap, mod_assets_type_map)
++	if (!block)
++	{
++		log("Could not load mod block", blockmap[?"name"])
++		return null
++	}
++
++	return block
++}
++
++/// Called when all blocks are loaded.
++function modworld_load_done()
++{
++	var baseheight = (mod_assets_base_sheet_height > 0 ? mod_assets_base_sheet_height : minecraft_block_sheet_size[1]);
++	modworld_set_sheet_info(minecraft_block_sheet_size[0], minecraft_block_sheet_size[1], baseheight)
++
++	if (mod_assets_map != null)
++	{
++		ds_map_destroy(mod_assets_map)
++		mod_assets_map = null
++	}
++
++	if (mod_assets_type_map != null)
++	{
++		ds_map_destroy(mod_assets_type_map)
++		mod_assets_type_map = null
++	}
++
++	if (mod_assets_block_amount > 0)
++		log("Loaded mod blocks", mod_assets_block_amount)
++}
++
++/// Returns whether a file is in the mod asset cache.
++function modworld_is_mod_file(fname)
++{
++	return (mod_assets_dir != "" && string_pos(mod_assets_dir, fname) = 1)
++}
++
++/// Key for loaded model files. Minecraft models use the file name, mod models the full path.
++function modworld_model_cache_key(fname)
++{
++	if (modworld_is_mod_file(fname))
++		return fname
++
++	return filename_name(fname)
++}
++
++/// Returns the file of a block state ("stone.json" or "namespace:name").
++function modworld_state_file_path(filename)
++{
++	var c = string_pos(":", filename);
++	if (c = 0 || mod_assets_dir = "")
++		return load_assets_dir + mc_blockstates_directory + filename
++
++	return mod_assets_dir + "assets/" + string_copy(filename, 1, c - 1) + "/blockstates/" + string_delete(filename, 1, c) + ".json"
++}
++
++/// Returns the file of a block model ("block/stone" or "namespace:block/name").
++function modworld_model_file_path(name)
++{
++	var c = string_pos(":", name);
++	if (c = 0 || mod_assets_dir = "")
++		return load_assets_dir + mc_models_directory + name + ".json"
++
++	name = string_lower(name)
++	return mod_assets_dir + "assets/" + string_copy(name, 1, c - 1) + "/models/" + string_delete(name, 1, c) + ".json"
++}
++
++/// Returns the file of a block texture ("block/stone" or "namespace:block/name").
++/// Resource packs may contain mod textures, the default pack uses the mod asset cache.
++function modworld_texture_file_path(name, suffix)
++{
++	var c = string_pos(":", name);
++	if (c = 0)
++		return load_assets_dir + mc_textures_directory + name + suffix + ".png"
++
++	var ns, path, fn;
++	ns = string_copy(name, 1, c - 1)
++	path = string_delete(name, 1, c)
++	fn = load_assets_dir + "assets/" + ns + "/textures/" + path + suffix + ".png"
++
++	if (!file_exists_lib(fn) && mod_assets_dir != "" && load_assets_dir = load_assets_startup_dir)
++		fn = mod_assets_dir + "assets/" + ns + "/textures/" + path + suffix + ".png"
++
++	return fn
+ }
+ 
+ /// CppSeparate BoolType world_import_has_selection()
+@@ -159,6 +409,7 @@ function world_import_dimension_menu_init()
+ 		menu_add_item("the_nether", text_get("worldimportthenether"))
+ 	if (world_import_has_dimension("the_end"))
+ 		menu_add_item("the_end", text_get("worldimporttheend"))
++	world_import_dimension_menu_add_mods()
+ }
+ 
+ /// Draw the world import interface.
+@@ -233,7 +484,7 @@ function window_draw_world_import()
+ 	dx += dw + spacing
+ 	dw = 208
+ 	capwid = 80
+-	draw_button_menu("worldimportdimension", e_menu.LIST, dx, dy, dw, 24, world_import_dimension, text_get("worldimport" + string_replace_all(world_import_dimension, "_", "")), world_import_select_dimension, false, null, null, "", null, null, capwid)
++	draw_button_menu("worldimportdimension", e_menu.LIST, dx, dy, dw, 24, world_import_dimension, world_import_dimension_name(world_import_dimension), world_import_select_dimension, false, null, null, "", null, null, capwid)
+ 	
+ 	dx += dw + 12
+ 	
+@@ -250,7 +501,7 @@ function window_draw_world_import()
+ 	
+ 	dx += dw + spacing
+ 	if (draw_button_icon("worldimportinstance", dx, dy, dw, dw, false, icons.FOLDER, null, false, "worldimportinstancetip"))
+-		world_import_choose_instance()
++		world_import_choose_instance_folder()
+ 
+ 	dx += dw + spacing
+ 	var worldpicked = world_import_world_root != "";

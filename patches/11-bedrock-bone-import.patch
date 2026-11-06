@@ -1,0 +1,274 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 90efd8d..ac3c475 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -15,6 +15,8 @@
+ #include <QListWidget>
+ #include <QTreeWidget>
+ #include <QComboBox>
++#include <QCheckBox>
++#include <functional>
+ #include <QVBoxLayout>
+ #include <QHBoxLayout>
+ #include <QPainter>
+@@ -438,10 +440,123 @@ namespace CppProject
+ 		return path;
+ 	}
+ 
++	// Convert a conservative subset of Bedrock geometry into native .mimodel.
++	// Unsupported features fail explicitly; this never executes code from the mod.
++	static QString mod_bedrock_to_mimodel(const QByteArray& data, const QByteArray& png, bool editable, QString* error)
++	{
++		auto fail=[error](const QString& why)->QString { *error=why; return ""; };
++		QJsonParseError err; QJsonDocument doc=QJsonDocument::fromJson(data,&err);
++		if (err.error!=QJsonParseError::NoError || !doc.isObject()) return fail("Invalid Bedrock geometry JSON.");
++		QJsonArray geos=doc.object().value("minecraft:geometry").toArray();
++		if (geos.size()!=1 || !geos[0].isObject()) return fail("Exactly one Bedrock geometry is required.");
++		QJsonObject geo=geos[0].toObject(), desc=geo.value("description").toObject();
++		QJsonArray bones=geo.value("bones").toArray();
++		if (bones.isEmpty() || bones.size()>512) return fail("Invalid or excessive bone count (maximum 512).");
++		int tw=desc.value("texture_width").toInt(), th=desc.value("texture_height").toInt();
++		if (tw<1 || th<1 || tw>2048 || th>2048) return fail("Invalid model texture dimensions.");
++		QByteArray pngCopy=png; QBuffer imgBuffer(&pngCopy); imgBuffer.open(QIODevice::ReadOnly);
++		QImageReader reader(&imgBuffer,"png");
++		if (reader.size()!=QSize(tw,th) || reader.read().isNull()) return fail("Texture size does not match the geometry description.");
++		auto vector=[](const QJsonValue& value,int count,QJsonArray& out)->bool {
++			if (!value.isArray() || value.toArray().size()!=count) return false;
++			out=value.toArray(); for (const QJsonValue& n:out) if(!n.isDouble() || !std::isfinite(n.toDouble()) || std::abs(n.toDouble())>4096) return false;
++			return true;
++		};
++		auto pos=[](const QJsonArray& a)->QVector3D { return QVector3D(-a[0].toDouble(),a[1].toDouble(),a[2].toDouble()); };
++		auto arr=[](const QVector3D& p)->QJsonArray { return QJsonArray{p.x(),p.y(),p.z()}; };
++		auto angle=[&vector](const QJsonValue& val, QJsonArray& out)->bool {
++			if (val.isUndefined()) { out=QJsonArray{0,0,0}; return true; }
++			QJsonArray a; if(!vector(val,3,a)) return false;
++			// Reflection of Bedrock's X axis, following Blockbench's Bedrock importer.
++			out=QJsonArray{-a[0].toDouble(),-a[1].toDouble(),a[2].toDouble()}; return true;
++		};
++		QMap<QString,QJsonObject> byName; QMap<QString,QStringList> children; QMap<QString,QVector3D> pivots; QStringList roots;
++		int countCubes=0;
++		for (const QJsonValue& value:bones) {
++			if(!value.isObject()) return fail("Invalid bone."); QJsonObject b=value.toObject();
++			QString name=b.value("name").toString(), parent=b.value("parent").toString(); QJsonArray pivot,rot;
++			if(name.isEmpty() || name.size()>120 || byName.contains(name)) return fail("Missing, duplicate or excessively long bone name.");
++			if(!vector(b.value("pivot"),3,pivot) || !angle(b.value("rotation"),rot)) return fail("Invalid bone pivot or rotation: "+name);
++			if(b.contains("poly_mesh") || b.contains("texture_meshes") || b.contains("binding")) return fail("Unsupported bone geometry or binding: "+name);
++			if(b.contains("cubes") && !b.value("cubes").isArray()) return fail("Invalid cubes: "+name);
++			countCubes+=b.value("cubes").toArray().size(); if(countCubes>4096) return fail("Too many cubes.");
++			byName.insert(name,b); pivots.insert(name,pos(pivot));
++			if(parent.isEmpty()) roots.append(name); else children[parent].append(name);
++		}
++		for (auto it=children.cbegin();it!=children.cend();++it) if(!byName.contains(it.key())) return fail("Missing parent bone: "+it.key());
++		if(roots.isEmpty()) return fail("Bone hierarchy has no root.");
++		// Omit geometry-free branches (mostly locators). Empty leaf parts leave
++		// infinite bounds in Mine-imator, which can break the model preview.
++		QMap<QString,int> state; QMap<QString,bool> keep; QString graphError;
++		std::function<bool(const QString&,int)> hasGeometry;
++		hasGeometry=[&](const QString& name,int depth)->bool {
++			if(depth>80 || state.value(name)==1) { graphError="Bone hierarchy has a cycle or is too deep."; return false; }
++			if(state.value(name)==2) return keep.value(name);
++			state[name]=1; bool found=!byName.value(name).value("cubes").toArray().isEmpty();
++			for(const QString& child:children.value(name)) { bool childHas=hasGeometry(child,depth+1); found=found || childHas; if(!graphError.isEmpty()) return false; }
++			state[name]=2; keep[name]=found; return found;
++		};
++		for(auto it=byName.cbegin();it!=byName.cend();++it) { hasGeometry(it.key(),0); if(!graphError.isEmpty()) return fail(graphError); }
++		if(countCubes==0) return fail("The geometry has no cubes to import.");
++		QSet<QString> visited; bool bad=false; QString why;
++		std::function<QJsonObject(const QString&,const QVector3D&,int)> build;
++		build=[&](const QString& name,const QVector3D& parentPivot,int depth)->QJsonObject {
++			if (bad) return {};
++			if(depth>80 || visited.contains(name)) { bad=true; why="Bone hierarchy has a cycle or is too deep."; return {}; }
++			visited.insert(name); QJsonObject b=byName.value(name), part; QVector3D bonePivot=pivots.value(name); QJsonArray rotation;
++			if(!angle(b.value("rotation"),rotation)) { bad=true;why="Invalid bone rotation.";return {}; }
++			part.insert("name",name); part.insert("position",arr(bonePivot-parentPivot)); part.insert("rotation",rotation);
++			if(!editable) part.insert("locked",true);
++			part.insert("backfaces",true);
++			QJsonArray shapes,subparts; QJsonArray cubes=b.value("cubes").toArray();
++			for(int i=0;i<cubes.size();++i) {
++				if(!cubes[i].isObject()) { bad=true;why="Invalid cube: "+name;return {}; }
++				QJsonObject c=cubes[i].toObject(); QJsonArray origin,size,uv,crot,pivot;
++				if(!vector(c.value("origin"),3,origin) || !vector(c.value("size"),3,size) || !vector(c.value("uv"),2,uv) || !angle(c.value("rotation"),crot)) { bad=true;why="Unsupported cube or per-face UV: "+name;return {}; }
++				for(const QJsonValue& n:size) if(n.toDouble()<0) {bad=true;why="Negative cube size: "+name;return {};}
++				if(c.contains("inflate") && !c.value("inflate").isDouble()) { bad=true;why="Invalid inflation: "+name;return {}; }
++				double inf=c.contains("inflate")?c.value("inflate").toDouble():b.value("inflate").toDouble();
++				if(!std::isfinite(inf) || std::abs(inf)>128) { bad=true;why="Unsupported inflation: "+name;return {}; }
++				bool rotated=crot[0].toDouble()!=0 || crot[1].toDouble()!=0 || crot[2].toDouble()!=0;
++				QVector3D cubePivot=bonePivot;
++				if(rotated) { if(!vector(c.value("pivot"),3,pivot)) {bad=true;why="Rotated cube is missing its pivot: "+name;return {};} cubePivot=pos(pivot); }
++				QVector3D from(-origin[0].toDouble()-size[0].toDouble(),origin[1].toDouble(),origin[2].toDouble());
++				QVector3D to=from+QVector3D(size[0].toDouble(),size[1].toDouble(),size[2].toDouble());
++				QJsonObject shape; shape.insert("type","block"); shape.insert("from",arr(from-cubePivot));shape.insert("to",arr(to-cubePivot));
++				// MI's box-UV origin is the front face, offset by depth from Bedrock UV.
++				double d=std::floor(size[2].toDouble()+0.000001);
++				shape.insert("uv",QJsonArray{uv[0].toDouble()+d,uv[1].toDouble()+d});
++				if(inf!=0) shape.insert("inflate",inf);
++				if(c.value("mirror").isBool()?c.value("mirror").toBool():b.value("mirror").toBool()) shape.insert("texture_mirror",true);
++				if(rotated) {
++					QString synthetic="__mi_cube_"+QString::number(visited.size())+"_"+QString::number(i);
++					while(byName.contains(synthetic) || visited.contains(synthetic)) synthetic+="_";
++					visited.insert(synthetic); QJsonObject sub; sub.insert("name",synthetic);sub.insert("position",arr(cubePivot-bonePivot));sub.insert("rotation",crot);sub.insert("locked",true);sub.insert("backfaces",true);sub.insert("shapes",QJsonArray{shape});subparts.append(sub);
++				} else shapes.append(shape);
++			}
++			if(!shapes.isEmpty()) part.insert("shapes",shapes);
++			for(const QString& child:children.value(name)) if(keep.value(child)) subparts.append(build(child,bonePivot,depth+1));
++			if(!subparts.isEmpty()) part.insert("parts",subparts); return part;
++		};
++		QJsonArray parts; for(const QString& root:roots) if(keep.value(root)) parts.append(build(root,QVector3D(),0));
++		if(bad) return fail(why);
++		// visited contains synthetic cube nodes too; validate all actual bones were reached.
++		for(auto it=byName.cbegin();it!=byName.cend();++it) if(keep.value(it.key()) && !visited.contains(it.key())) return fail("Disconnected or cyclic bone hierarchy.");
++		QTemporaryDir temp(QDir::tempPath()+"/MineimatorBedrock-XXXXXX"); if(!temp.isValid()) return fail("Cannot create a temporary model directory.");
++		QString suffix=QFileInfo(temp.path()).fileName().right(6);
++		QString tex="bedrock_texture_"+suffix+".png";
++		QJsonObject model; model.insert("name","Bedrock model"); model.insert("texture",tex);model.insert("texture_size",QJsonArray{tw,th});model.insert("floor_box_uvs",true);model.insert("parts",parts);
++		auto write=[&temp](const QString& name,const QByteArray& bytes)->bool { QFile f(temp.filePath(name));return f.open(QIODevice::WriteOnly|QIODevice::NewOnly)&&f.write(bytes)==bytes.size()&&f.flush(); };
++		QString fileName="BedrockModel-"+suffix+".mimodel";
++		if(!write(tex,png) || !write(fileName,QJsonDocument(model).toJson(QJsonDocument::Compact))) return fail("Cannot save temporary model or texture.");
++		QString result=temp.filePath(fileName); temp.setAutoRemove(false); return result;
++	}
++
++
+ 	// Cobblemon uses Bedrock geometry. This is a browser/exporter for Blockbench,
+ 	// not a Mine-imator skeletal importer; it reads archive data and runs no mod code.
+ 	template<class ReadEntry>
+-	static void mod_browse_cobblemon(const QMap<QString, zip_uint64_t>& entries, ReadEntry& readEntry)
++	static QString mod_browse_cobblemon(const QMap<QString, zip_uint64_t>& entries, ReadEntry& readEntry)
+ 	{
+ 		const QString modelRoot = "assets/cobblemon/bedrock/pokemon/models/";
+ 		const QString textureRoot = "assets/cobblemon/textures/pokemon/";
+@@ -454,13 +569,13 @@ namespace CppProject
+ 			}
+ 		}
+ 		if (models.isEmpty() || models.size()>10000) {
+-			QMessageBox::information(nullptr, "Cobblemon", "No supported Pokemon geometry files found in this JAR."); return;
++			QMessageBox::information(nullptr, "Cobblemon", "No supported Pokemon geometry files found in this JAR."); return QString();
+ 		}
+ 		models.sort(Qt::CaseInsensitive);
+ 		QDialog dialog; dialog.setWindowTitle("Cobblemon models and bones"); dialog.resize(1000,600);
+ 		dialog.setStyleSheet("QDialog { background:#17191d; color:#e5e8ef; font-size:13px; } QLabel {color:#b8c1d0; padding:4px;} QLineEdit,QListWidget,QTreeWidget,QComboBox {background:#20242b; color:#f1f4f8; border:1px solid #414954; padding:5px;} QListWidget::item {padding:4px;} QListWidget::item:selected {background:#476da9;} QPushButton {background:#344c72; color:white; border:1px solid #6286bc; padding:7px;}");
+ 		QVBoxLayout layout(&dialog);
+-		QLabel notice("Browse Bedrock geometry and its bone/parent list. Opens a copy in Blockbench, NOT in Mine-imator. Texture must be imported manually; animations are not included.");
++		QLabel notice("Experimental Bedrock import. Verify the texture, then press Create in the workbench. Animations and geometry-free locator branches are not imported.");
+ 		notice.setWordWrap(true); layout.addWidget(&notice);
+ 		QHBoxLayout body; layout.addLayout(&body);
+ 		QVBoxLayout left; body.addLayout(&left, 2); QVBoxLayout right; body.addLayout(&right, 3);
+@@ -472,7 +587,10 @@ namespace CppProject
+ 		QTreeWidget bones; bones.setColumnCount(3); bones.setHeaderLabels(QStringList{"Bone", "Parent", "Cubes"}); right.addWidget(&bones,1);
+ 		QLabel textureLabel("Texture copy (choose manually if needed)"); right.addWidget(&textureLabel);
+ 		QComboBox textures; right.addWidget(&textures);
++		QCheckBox editable("Enable individual bone controls (unchecked: lock bones, not merge)"); editable.setChecked(true); right.addWidget(&editable);
++		QPushButton useModel("Use model in Mine-imator"); right.addWidget(&useModel);
+ 		QPushButton open("Open geometry copy in Blockbench..."); right.addWidget(&open);
++		QString importedPath;
+ 		QDialogButtonBox buttons(QDialogButtonBox::Close); layout.addWidget(&buttons);
+ 		QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+ 		QObject::connect(&search, &QLineEdit::textChanged, &list, [&list](const QString& text) {
+@@ -512,6 +630,16 @@ namespace CppProject
+ 			details.setText(QString("%1 bones, %2 cubes. Texture is a suggested choice; verify the variant.").arg(array.size()).arg(cubes));
+ 			open.setEnabled(true);
+ 		});
++		QObject::connect(&useModel, &QPushButton::clicked, &dialog, [&]() {
++			QListWidgetItem* item=list.currentItem(); if (!item || item->isHidden()) return;
++			QByteArray geometry, png;
++			if (!readEntry(item->data(Qt::UserRole).toString(),8388608,geometry) || textures.currentIndex()<0 || !readEntry(textures.currentData().toString(),8388608,png)) {
++				QMessageBox::warning(&dialog,"Bedrock import","Cannot read geometry or selected texture."); return;
++			}
++			QString error; QString result=mod_bedrock_to_mimodel(geometry,png,editable.isChecked(),&error);
++			if(result.isEmpty()) { QMessageBox::warning(&dialog,"Bedrock import",error); return; }
++			importedPath=result; dialog.accept();
++		});
+ 		QObject::connect(&open, &QPushButton::clicked, &dialog, [&dialog, &list, &textures, &readEntry]() {
+ 			QListWidgetItem* item=list.currentItem(); if (!item || item->isHidden()) return;
+ 			QString exe=QFileDialog::getOpenFileName(&dialog,"Select installed Blockbench executable","","Applications (*.exe)"); if(exe.isEmpty()) return;
+@@ -537,6 +665,27 @@ namespace CppProject
+ 		});
+ 		list.setCurrentRow(0);
+ 		App->ExecDialog(&dialog);
++		return importedPath;
++	}
++
++	// Import external Bedrock data only; never executes a mod or opens an archive.
++	StringType mod_import_bedrock_file()
++	{
++		QString geometryPath=QFileDialog::getOpenFileName(nullptr,"Select Bedrock geometry",QString(),"Bedrock geometry (*.geo.json *.json)");
++		if(geometryPath.isEmpty()) return "";
++		QString texturePath=QFileDialog::getOpenFileName(nullptr,"Select matching PNG texture",QFileInfo(geometryPath).absolutePath(),"PNG image (*.png)");
++		if(texturePath.isEmpty()) return "";
++		auto read=[](const QString& path,QByteArray& out)->bool { QFile f(path); if(!f.open(QIODevice::ReadOnly) || f.size()>8388608) return false; out=f.readAll(); return f.error()==QFile::NoError; };
++		QByteArray geometry,png; if(!read(geometryPath,geometry) || !read(texturePath,png)) return "ERROR: Cannot read geometry or texture (maximum 8 MB each).";
++		QDialog dialog; dialog.setWindowTitle("Bedrock import options"); QVBoxLayout layout(&dialog);
++		QLabel note("Experimental import; animations and non-cube geometry are not supported.\nUnchecked locks the bones; it does not merge the geometry."); note.setWordWrap(true); layout.addWidget(&note);
++		QCheckBox editable("Enable individual bone controls"); editable.setChecked(true); layout.addWidget(&editable);
++		QDialogButtonBox buttons(QDialogButtonBox::Ok|QDialogButtonBox::Cancel); layout.addWidget(&buttons);
++		QObject::connect(&buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
++		QObject::connect(&buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
++		App->ExecDialog(&dialog); if(dialog.result()!=QDialog::Accepted) return "";
++		QString error, result=mod_bedrock_to_mimodel(geometry,png,editable.isChecked(),&error);
++		if(result.isEmpty()) return QString("ERROR: ")+error; return result;
+ 	}
+ 
+ 	// Experimental static Minecraft block model importer. Reads data only, never mod code.
+@@ -606,7 +755,7 @@ namespace CppProject
+ 		};
+ 		QJsonObject metadata;
+ 		if (!readJson("fabric.mod.json", metadata) || !metadata.value("id").isString()) return "ERROR: Valid Fabric metadata not found.";
+-		if (metadata.value("id").toString() == "cobblemon") { mod_browse_cobblemon(entries, readEntry); return ""; }
++		if (metadata.value("id").toString() == "cobblemon") return mod_browse_cobblemon(entries, readEntry);
+ 		const QRegularExpression idPattern("^([a-z0-9_.-]+):([a-z0-9_./-]+)$");
+ 		auto resourcePath = [&idPattern](const QString& id, const QString& folder, const QString& suffix) -> QString {
+ 			if (id.size() > 240) return QString();
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index a8f54d4..03548bb 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -576,7 +576,8 @@
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
+ 		"modstitle": "Mods",
+-		"modsnotice": "Inspect a Fabric mod JAR, then browse models. Cobblemon opens a Bedrock browser for Blockbench; Mine-imator bone import is not available yet.",
++		"modsnotice": "Browse models in a Fabric JAR or import Bedrock geometry. Bone import is experimental; animations are not included.",
++		"modsbedrock": "Import Bedrock geometry...",
+ 		"modsopen": "Inspect Fabric mod...",
+ 		"modschair": "Prepare acacia chair",
+ 		"modsmodel": "Find and preview a model...",
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index 9378506..4ebec2d 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -77,14 +77,15 @@ function bench_draw_settings(bx, by, bw, bh)
+ 			}
+ 		}
+ 		dy += 40
++		var prepared_model = ""
+ 		if (draw_button_label("benchmodsmodel", dx, dy, dw, icons.MODEL, e_button.SECONDARY, null, e_anchor.LEFT, bench_mods_path = ""))
++			prepared_model = mod_import_static_model(bench_mods_path, load_assets_zip_file)
++		dy += 40
++		if (draw_button_label("benchmodsbedrock", dx, dy, dw, icons.MODEL, e_button.SECONDARY))
++			prepared_model = mod_import_bedrock_file()
++		if (prepared_model != "")
+ 		{
+-			var prepared_model = mod_import_static_model(bench_mods_path, load_assets_zip_file)
+-			if (prepared_model = "")
+-			{
+-				// Selection cancelled.
+-			}
+-			else if (string_pos("ERROR:", prepared_model) = 1)
++			if (string_pos("ERROR:", prepared_model) = 1)
+ 				bench_mods_info = prepared_model
+ 			else
+ 			{
+diff --git a/GmProject/scripts/util_cpp/util_cpp.gml b/GmProject/scripts/util_cpp/util_cpp.gml
+index 2e6e179..1d5be5b 100644
+--- a/GmProject/scripts/util_cpp/util_cpp.gml
++++ b/GmProject/scripts/util_cpp/util_cpp.gml
+@@ -438,3 +438,10 @@ function mod_import_static_model(filename, minecraft_assets_zip)
+ {
+ 	return "ERROR: C++ build required."
+ }
++
++/// CppSeparate StringType mod_import_bedrock_file()
++/// Prepare a Bedrock geometry and its selected PNG texture.
++function mod_import_bedrock_file()
++{
++	return "ERROR: C++ build required."
++}

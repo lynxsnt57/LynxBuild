@@ -1,0 +1,118 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 6237ca8..244826d 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -536,7 +536,19 @@ namespace CppProject
+ 				QString path = resourcePath(current, "models", ".json");
+ 				QJsonObject layer;
+ 				if (path.isEmpty() || !readJson(path, layer)) return "ERROR: Model parent missing from JAR or invalid (Minecraft/dependency assets are not supported yet).";
+-				if (layer.contains("loader")) return "ERROR: This model uses a custom loader; not supported yet.";
++				// Framework open_model stores static cuboids in "components".
++				// Other loaders may implement arbitrary semantics and are not executed.
++				if (layer.contains("loader") || layer.contains("fabric:type")) {
++					QString loader = layer.value("loader").toString();
++					QString fabricType = layer.value("fabric:type").toString();
++					if ((!loader.isEmpty() && loader != "framework:open_model") ||
++					    (!fabricType.isEmpty() && fabricType != "framework:open_model") ||
++					    (loader.isEmpty() && fabricType.isEmpty()) ||
++					    !layer.value("components").isArray() || layer.contains("elements"))
++						return "ERROR: This custom model loader is not supported.";
++					layer.insert("elements", layer.value("components"));
++					layer.remove("components"); layer.remove("loader"); layer.remove("fabric:type");
++				}
+ 				layers.append(layer);
+ 				if (!layer.contains("parent")) break;
+ 				if (!layer.value("parent").isString()) return "ERROR: Invalid model parent.";
+@@ -574,7 +586,8 @@ namespace CppProject
+ 					if (axis != "x" && axis != "y" && axis != "z") return "ERROR: Unsupported rotation axis.";
+ 					if (!rotation.value("angle").isDouble()) return "ERROR: Invalid rotation angle.";
+ 					double angle = rotation.value("angle").toDouble();
+-					if (!std::isfinite(angle) || (angle != -45 && angle != -22.5 && angle != 0 && angle != 22.5 && angle != 45)) return "ERROR: Unsupported rotation angle.";
++					// Native loader accepts arbitrary single-axis angles; guard rescale near 90 degrees.
++					if (!std::isfinite(angle) || std::abs(angle) > 360 || (rotation.value("rescale").toBool() && std::abs(std::cos(angle * 3.141592653589793 / 180.0)) < 0.01)) return "ERROR: Unsupported rotation angle.";
+ 					if (rotation.contains("origin") && !numbers(rotation.value("origin"), 3)) return "ERROR: Invalid rotation origin.";
+ 					if (rotation.contains("rescale") && !rotation.value("rescale").isBool()) return "ERROR: Invalid rotation rescale flag.";
+ 				}
+@@ -601,7 +614,26 @@ namespace CppProject
+ 				}
+ 			}
+ 			if (needed.size() > 32) return "ERROR: Too many textures.";
+-			for (const QString& key : tinted) if (plain.contains(key)) return "ERROR: Mixed tinted and plain faces are not supported yet.";
++			// Give tinted faces their own texture slot if the same slot is also used
++			// without tint. Never modify the source archive or the original image.
++			const QSet<QString> originalTinted = tinted;
++			for (const QString& key : originalTinted) if (plain.contains(key)) {
++				QString alias = "__mi_tint_" + QString::number(textureRefs.size());
++				while (textureRefs.contains(alias) || needed.contains(alias)) alias += "_";
++				textureRefs.insert(alias, "#" + key); needed.insert(alias);
++				for (int i=0; i<elements.size(); ++i) {
++					QJsonObject element = elements[i].toObject(); QJsonObject faces = element.value("faces").toObject();
++					for (auto it=faces.begin(); it!=faces.end(); ++it) {
++						QJsonObject face=it.value().toObject();
++						if (face.contains("tintindex") && face.value("texture").toString() == "#" + key) {
++							face.insert("texture", "#" + alias); it.value()=face;
++						}
++					}
++					element.insert("faces", faces); elements[i]=element;
++				}
++				tinted.remove(key); tinted.insert(alias);
++			}
++			if (needed.size() > 32) return "ERROR: Too many texture slots after tint separation.";
+ 			QJsonObject localTextures;
+ 			QMap<QString, QByteArray> images;
+ 			int imageNo = 0;
+@@ -609,7 +641,8 @@ namespace CppProject
+ 			for (const QString& key : needed) {
+ 				QString ref = key; QSet<QString> seen;
+ 				while (true) {
+-					if (seen.contains(ref) || !textureRefs.value(ref).isString()) return "ERROR: Unresolved or cyclic texture reference.";
++					if (seen.contains(ref)) return "ERROR: Cyclic texture reference: #" + ref;
++					if (!textureRefs.value(ref).isString()) return "ERROR: Missing texture #" + ref + ". This may be a template; try a named variant instead.";
+ 					seen.insert(ref);
+ 					QString value = textureRefs.value(ref).toString();
+ 					if (value.startsWith('#')) { ref = value.mid(1); continue; }
+@@ -634,10 +667,20 @@ namespace CppProject
+ 					}
+ 					QBuffer buffer(&bytes); if (!buffer.open(QIODevice::ReadOnly)) return "ERROR: Invalid texture.";
+ 					QImageReader reader(&buffer, "png"); QSize size = reader.size();
+-					if (!size.isValid() || size.width() != size.height() || size.width() > 4096 || size.height() > 4096) return "ERROR: Unsupported PNG dimensions.";
++					if (!size.isValid() || size.width() <= 0 || size.height() <= 0 || size.width() > 2048 || size.height() > 2048) return "ERROR: Unsupported PNG dimensions (maximum 2048 per side).";
+ 					QImage image = reader.read(); if (image.isNull()) return "ERROR: Invalid PNG texture.";
+-					if (tinted.contains(key)) {
+-						if (path != "assets/minecraft/textures/block/acacia_leaves.png") return "ERROR: This tint source is not supported yet.";
++					bool changedImage = false;
++					// Mine-imator pads rectangular textures to a square. Instead, scale the
++					// copy to a square so normalised Minecraft UVs retain their appearance.
++					if (size.width() != size.height()) {
++						int side = std::max(size.width(), size.height());
++						image = image.scaled(side, side, Qt::IgnoreAspectRatio, Qt::FastTransformation);
++						if (image.isNull()) return "ERROR: Cannot resize texture.";
++						changedImage = true;
++					}
++					// Other tint sources depend on game/mod logic. Leave them untinted
++					// rather than invent a colour (the dialog warns about this fallback).
++					if (tinted.contains(key) && path == "assets/minecraft/textures/block/acacia_leaves.png") {
+ 						QByteArray colorBytes; if (!readMc("assets/minecraft/textures/colormap/foliage.png", 1048576, colorBytes)) return "ERROR: Minecraft foliage colormap is missing.";
+ 						QBuffer colorBuffer(&colorBytes); colorBuffer.open(QIODevice::ReadOnly); QImageReader colorReader(&colorBuffer, "png");
+ 						if (colorReader.size() != QSize(256,256)) return "ERROR: Invalid foliage colormap.";
+@@ -648,7 +691,10 @@ namespace CppProject
+ 							QColor px = image.pixelColor(x,y);
+ 							px.setRgb(px.red()*tint.red()/255, px.green()*tint.green()/255, px.blue()*tint.blue()/255, px.alpha()); image.setPixelColor(x,y,px);
+ 						}
+-						bytes.clear(); QBuffer out(&bytes); if (!out.open(QIODevice::WriteOnly) || !image.save(&out,"PNG")) return "ERROR: Cannot encode tinted texture.";
++						changedImage = true;
++					}
++					if (changedImage) {
++						bytes.clear(); QBuffer out(&bytes); if (!out.open(QIODevice::WriteOnly) || !image.save(&out,"PNG") || bytes.size() > 8388608) return "ERROR: Cannot encode converted texture.";
+ 					}
+ 					QString local = QString("mod_texture_%1").arg(imageNo++);
+ 					images.insert(local + ".png", bytes); localTextures.insert(key, local);
+@@ -705,7 +751,7 @@ namespace CppProject
+ 		preview.setMinimumSize(300, 300);
+ 		preview.setStyleSheet("QLabel { background: #20242b; color: #b8c1d0; border: 1px solid #414954; border-radius: 4px; }");
+ 		right->addWidget(&preview, 1);
+-		QLabel previewNote("Preview is approximate. Acacia leaves use an approximate plains tint."); previewNote.setWordWrap(true); right->addWidget(&previewNote);
++		QLabel previewNote("Approximate preview. Acacia leaves use plains tint; unknown tints are shown without colour."); previewNote.setWordWrap(true); right->addWidget(&previewNote);
+ 		QPushButton openBlockbench("Open copy in Blockbench..."); right->addWidget(&openBlockbench);
+ 		QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); layout.addWidget(&buttons);
+ 		QTimer previewTimer; previewTimer.setSingleShot(true); previewTimer.setInterval(200);

@@ -1,0 +1,142 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 244826d..90efd8d 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -13,6 +13,8 @@
+ #include <QLabel>
+ #include <QLineEdit>
+ #include <QListWidget>
++#include <QTreeWidget>
++#include <QComboBox>
+ #include <QVBoxLayout>
+ #include <QHBoxLayout>
+ #include <QPainter>
+@@ -436,6 +438,107 @@ namespace CppProject
+ 		return path;
+ 	}
+ 
++	// Cobblemon uses Bedrock geometry. This is a browser/exporter for Blockbench,
++	// not a Mine-imator skeletal importer; it reads archive data and runs no mod code.
++	template<class ReadEntry>
++	static void mod_browse_cobblemon(const QMap<QString, zip_uint64_t>& entries, ReadEntry& readEntry)
++	{
++		const QString modelRoot = "assets/cobblemon/bedrock/pokemon/models/";
++		const QString textureRoot = "assets/cobblemon/textures/pokemon/";
++		QStringList models;
++		for (auto it=entries.cbegin(); it!=entries.cend(); ++it) {
++			const QString path=it.key();
++			if (path.startsWith(modelRoot) && path.endsWith(".geo.json")) {
++				QString rest=path.mid(modelRoot.size());
++				if (QRegularExpression("^[a-z0-9_.-]+/[a-z0-9_.-]+\\.geo\\.json$").match(rest).hasMatch()) models.append(path);
++			}
++		}
++		if (models.isEmpty() || models.size()>10000) {
++			QMessageBox::information(nullptr, "Cobblemon", "No supported Pokemon geometry files found in this JAR."); return;
++		}
++		models.sort(Qt::CaseInsensitive);
++		QDialog dialog; dialog.setWindowTitle("Cobblemon models and bones"); dialog.resize(1000,600);
++		dialog.setStyleSheet("QDialog { background:#17191d; color:#e5e8ef; font-size:13px; } QLabel {color:#b8c1d0; padding:4px;} QLineEdit,QListWidget,QTreeWidget,QComboBox {background:#20242b; color:#f1f4f8; border:1px solid #414954; padding:5px;} QListWidget::item {padding:4px;} QListWidget::item:selected {background:#476da9;} QPushButton {background:#344c72; color:white; border:1px solid #6286bc; padding:7px;}");
++		QVBoxLayout layout(&dialog);
++		QLabel notice("Browse Bedrock geometry and its bone/parent list. Opens a copy in Blockbench, NOT in Mine-imator. Texture must be imported manually; animations are not included.");
++		notice.setWordWrap(true); layout.addWidget(&notice);
++		QHBoxLayout body; layout.addLayout(&body);
++		QVBoxLayout left; body.addLayout(&left, 2); QVBoxLayout right; body.addLayout(&right, 3);
++		QLineEdit search; search.setPlaceholderText("Search Pokemon models..."); left.addWidget(&search);
++		QListWidget list;
++		for (const QString& path:models) { QListWidgetItem* item=new QListWidgetItem(path.mid(modelRoot.size())); item->setData(Qt::UserRole,path); list.addItem(item); }
++		left.addWidget(&list);
++		QLabel details("Select a model"); details.setWordWrap(true); right.addWidget(&details);
++		QTreeWidget bones; bones.setColumnCount(3); bones.setHeaderLabels(QStringList{"Bone", "Parent", "Cubes"}); right.addWidget(&bones,1);
++		QLabel textureLabel("Texture copy (choose manually if needed)"); right.addWidget(&textureLabel);
++		QComboBox textures; right.addWidget(&textures);
++		QPushButton open("Open geometry copy in Blockbench..."); right.addWidget(&open);
++		QDialogButtonBox buttons(QDialogButtonBox::Close); layout.addWidget(&buttons);
++		QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
++		QObject::connect(&search, &QLineEdit::textChanged, &list, [&list](const QString& text) {
++			QListWidgetItem* first=nullptr;
++			for (int i=0;i<list.count();++i) { QListWidgetItem* item=list.item(i); bool visible=item->text().contains(text,Qt::CaseInsensitive); item->setHidden(!visible); if(visible && !first) first=item; }
++			list.setCurrentItem(first);
++		});
++		QObject::connect(&list, &QListWidget::currentItemChanged, &dialog, [&readEntry, &entries, &modelRoot, &textureRoot, &details, &bones, &textures, &open](QListWidgetItem* item, QListWidgetItem*) {
++			bones.clear(); textures.clear(); open.setEnabled(false);
++			if (!item || item->isHidden()) { details.setText("Select a model"); return; }
++			QString path=item->data(Qt::UserRole).toString(); QByteArray data;
++			if (!readEntry(path, 8388608, data)) { details.setText("Cannot read geometry (missing or too large)."); return; }
++			QJsonParseError err; QJsonDocument doc=QJsonDocument::fromJson(data, &err);
++			if (err.error!=QJsonParseError::NoError || !doc.isObject()) { details.setText("Invalid geometry JSON."); return; }
++			QJsonArray geos=doc.object().value("minecraft:geometry").toArray();
++			if (geos.size()!=1 || !geos[0].isObject()) { details.setText("Only single-geometry Bedrock models are supported here."); return; }
++			QJsonObject geo=geos[0].toObject(); QJsonArray array=geo.value("bones").toArray();
++			if (array.isEmpty() || array.size()>2048) { details.setText("Invalid or excessive number of bones."); return; }
++			int cubes=0;
++			for (const QJsonValue& val:array) {
++				QJsonObject bone=val.toObject(); QString name=bone.value("name").toString().left(120); QString parent=bone.value("parent").toString().left(120);
++				if (name.isEmpty()) { bones.clear(); details.setText("Invalid bone name."); return; }
++				int n=bone.value("cubes").toArray().size(); cubes+=n;
++				new QTreeWidgetItem(&bones, QStringList{name,parent,QString::number(n)});
++			}
++			QString group=path.mid(modelRoot.size()).section('/',0,0);
++			QString prefix=textureRoot+group+"/";
++			for (auto it=entries.cbegin(); it!=entries.cend(); ++it) {
++				QString p=it.key(); if (!p.startsWith(prefix) || !p.endsWith(".png")) continue;
++				QString name=p.mid(prefix.size());
++				if (!QRegularExpression("^[a-z0-9_.-]+\\.png$").match(name).hasMatch()) continue;
++				textures.addItem(name,p);
++			}
++			// Prefer the base species texture, not a shiny/emissive variant.
++			QString species=group; species.remove(QRegularExpression("^[0-9]+_"));
++			int defaultTexture=textures.findText(species+".png"); if (defaultTexture>=0) textures.setCurrentIndex(defaultTexture);
++			details.setText(QString("%1 bones, %2 cubes. Texture is a suggested choice; verify the variant.").arg(array.size()).arg(cubes));
++			open.setEnabled(true);
++		});
++		QObject::connect(&open, &QPushButton::clicked, &dialog, [&dialog, &list, &textures, &readEntry]() {
++			QListWidgetItem* item=list.currentItem(); if (!item || item->isHidden()) return;
++			QString exe=QFileDialog::getOpenFileName(&dialog,"Select installed Blockbench executable","","Applications (*.exe)"); if(exe.isEmpty()) return;
++			QByteArray geometry, png; QString path=item->data(Qt::UserRole).toString();
++			if (!readEntry(path,8388608,geometry)) { QMessageBox::warning(&dialog,"Cobblemon","Cannot read geometry."); return; }
++			bool hasTexture=textures.currentIndex()>=0;
++			if (hasTexture) {
++				if (!readEntry(textures.currentData().toString(),8388608,png)) { QMessageBox::warning(&dialog,"Cobblemon","Cannot read selected texture."); return; }
++				QBuffer buffer(&png); buffer.open(QIODevice::ReadOnly); QImageReader reader(&buffer,"png"); QSize size=reader.size();
++				if (!size.isValid() || size.width()>4096 || size.height()>4096 || reader.read().isNull()) { QMessageBox::warning(&dialog,"Cobblemon","Invalid or excessively large texture."); return; }
++			}
++			QTemporaryDir temp(QDir::tempPath()+"/MineimatorCobblemon-XXXXXX");
++			if (!temp.isValid()) { QMessageBox::warning(&dialog,"Cobblemon","Cannot create a temporary folder."); return; }
++			auto write=[&temp](const QString& name,const QByteArray& bytes) { QFile f(temp.filePath(name)); return f.open(QIODevice::WriteOnly|QIODevice::NewOnly) && f.write(bytes)==bytes.size() && f.flush(); };
++			if (!write("model.geo.json",geometry) || (hasTexture && !write("texture.png",png))) { QMessageBox::warning(&dialog,"Cobblemon","Cannot save temporary copies."); return; }
++			if (!QProcess::startDetached(exe,QStringList{temp.filePath("model.geo.json")},temp.path())) { QMessageBox::warning(&dialog,"Cobblemon","Could not start Blockbench."); return; }
++			QString folder=temp.path(); temp.setAutoRemove(false);
++			QString message="A geometry copy was sent to Blockbench. Bones remain in the Bedrock file. Save As to keep your changes.\n\n";
++			message += hasTexture ? "Import texture.png manually in Blockbench. It is in this temporary folder:\n" : "No matching texture was found. The geometry copy is in:\n";
++			message += QDir::toNativeSeparators(folder) + "\n\nThis does not import the model into Mine-imator or include animations.";
++			QMessageBox::information(&dialog,"Cobblemon",message);
++			QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
++		});
++		list.setCurrentRow(0);
++		App->ExecDialog(&dialog);
++	}
++
+ 	// Experimental static Minecraft block model importer. Reads data only, never mod code.
+ 	StringType mod_import_static_model(StringType jarPath, StringType minecraftZipPath)
+ 	{
+@@ -503,6 +606,7 @@ namespace CppProject
+ 		};
+ 		QJsonObject metadata;
+ 		if (!readJson("fabric.mod.json", metadata) || !metadata.value("id").isString()) return "ERROR: Valid Fabric metadata not found.";
++		if (metadata.value("id").toString() == "cobblemon") { mod_browse_cobblemon(entries, readEntry); return ""; }
+ 		const QRegularExpression idPattern("^([a-z0-9_.-]+):([a-z0-9_./-]+)$");
+ 		auto resourcePath = [&idPattern](const QString& id, const QString& folder, const QString& suffix) -> QString {
+ 			if (id.size() > 240) return QString();
+diff --git a/GmProject/datafiles/Data/Languages/english.milanguage b/GmProject/datafiles/Data/Languages/english.milanguage
+index bb0df13..a8f54d4 100644
+--- a/GmProject/datafiles/Data/Languages/english.milanguage
++++ b/GmProject/datafiles/Data/Languages/english.milanguage
+@@ -576,7 +576,7 @@
+ 	"workbenchcaption": "Workbench",
+ 	"bench/": {
+ 		"modstitle": "Mods",
+-		"modsnotice": "Inspect a Fabric mod JAR, then select a static block model. Some files are model parts or are not supported yet.",
++		"modsnotice": "Inspect a Fabric mod JAR, then browse models. Cobblemon opens a Bedrock browser for Blockbench; Mine-imator bone import is not available yet.",
+ 		"modsopen": "Inspect Fabric mod...",
+ 		"modschair": "Prepare acacia chair",
+ 		"modsmodel": "Find and preview a model...",

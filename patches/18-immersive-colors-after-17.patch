@@ -1,0 +1,89 @@
+diff --git a/CppProject/World/FurnitureBake.hpp b/CppProject/World/FurnitureBake.hpp
+index 6cf7eed..a2948ed 100644
+--- a/CppProject/World/FurnitureBake.hpp
++++ b/CppProject/World/FurnitureBake.hpp
+@@ -6,6 +6,10 @@
+ 
+ namespace ImmersiveFurniture {
+ constexpr int AtlasSize=128;
++// Minecraft NativeImage stores packed pixels as AABBGGRR; Qt expects AARRGGBB.
++constexpr std::uint32_t NativeAbgrToArgb(std::uint32_t p) {
++  return (p & 0xff00ff00u) | ((p & 0x00ff0000u) >> 16) | ((p & 0x000000ffu) << 16);
++}
+ struct Rect { int atlas=0,x=0,y=0,width=0,height=0; };
+ struct Face { std::string direction; Rect rect; };
+ struct BakedElement {
+diff --git a/CppProject/World/FurnitureCache.cpp b/CppProject/World/FurnitureCache.cpp
+index 7cbedc9..9c69eeb 100644
+--- a/CppProject/World/FurnitureCache.cpp
++++ b/CppProject/World/FurnitureCache.cpp
+@@ -57,7 +57,7 @@ void PrepareFurniture(const QString& instance,const QString& cache,QJsonArray& b
+   bool good=true;QStringList localTextures;
+   for(int i=0;i<(int)baked.atlases.size();i++){
+    const auto& src=baked.atlases[i];QImage image(128,128,QImage::Format_ARGB32);
+-   for(int y=0;y<128;y++)for(int x=0;x<128;x++)image.setPixel(x,y,src.pixels[y*128+x]);
++   for(int y=0;y<128;y++)for(int x=0;x<128;x++)image.setPixel(x,y,ImmersiveFurniture::NativeAbgrToArgb(src.pixels[y*128+x]));
+    QString name="block/"+hash+"_"+QString::number(i), filename=base+"/textures/"+name+".png";
+    QDir().mkpath(QFileInfo(filename).absolutePath());if(!image.save(filename,"PNG")){good=false;break;}localTextures<<ns+":"+name;
+   }
+@@ -69,7 +69,7 @@ void PrepareFurniture(const QString& instance,const QString& cache,QJsonArray& b
+     QJsonObject item,faceMap;item["from"]=point(e.source.from);item["to"]=point(e.source.to);
+     if(e.source.rotation!=0){QJsonArray origin;for(int j=0;j<3;j++)origin.append((e.source.from[j]+e.source.to[j])/2);QJsonObject rot;rot["origin"]=origin;rot["axis"]=QString(1, QChar(e.source.axis));rot["angle"]=e.source.rotation;item["rotation"]=rot;}
+     if(e.source.emission>0)item["light_emission"]=e.source.emission;
+-    for(const auto& f:e.faces){QString key="t"+QString::number(f.rect.atlas);textureMap[key]=localTextures.value(f.rect.atlas);QJsonObject face;face["texture"]="#"+key;face["uv"]=QJsonArray{f.rect.x/8.0,f.rect.y/8.0,(f.rect.x+f.rect.width)/8.0,(f.rect.y+f.rect.height)/8.0};faceMap[QString::fromStdString(f.direction)]=face;}
++    for(const auto& f:e.faces){QString key="t"+QString::number(f.rect.atlas);textureMap[key]=localTextures.value(f.rect.atlas);QJsonObject face;face["texture"]="#"+key;face["mineimator_render_type"]=QString::fromStdString(e.source.transparency);face["uv"]=QJsonArray{f.rect.x/8.0,f.rect.y/8.0,(f.rect.x+f.rect.width)/8.0,(f.rect.y+f.rect.height)/8.0};faceMap[QString::fromStdString(f.direction)]=face;}
+     if(e.source.kind==ImmersiveFurniture::Element::Kind::Sprite && !e.source.sprite.item && !e.source.sprite.tiled && e.source.sprite.size>0){
+      QString tex=textureName(e.source.sprite.texture);QString key="s"+QString::number(n);
+      if(tex.isEmpty()) { n++; continue; }
+diff --git a/CppProject/World/ModAssets.cpp b/CppProject/World/ModAssets.cpp
+index d1e6d8d..b36939b 100644
+--- a/CppProject/World/ModAssets.cpp
++++ b/CppProject/World/ModAssets.cpp
+@@ -35,7 +35,7 @@
+ 
+ #include <functional>
+ 
+-#define MODWORLD_CACHE_FORMAT 3
++#define MODWORLD_CACHE_FORMAT 4
+ #define MODWORLD_MAX_JSON_SIZE (4 * 1024 * 1024)
+ #define MODWORLD_MAX_PNG_SIZE (16 * 1024 * 1024)
+ #define MODWORLD_MAX_NESTED_JAR_SIZE (64 * 1024 * 1024)
+diff --git a/GmProject/scripts/block_load_model_file/block_load_model_file.gml b/GmProject/scripts/block_load_model_file/block_load_model_file.gml
+index c9ca3b3..d7442cc 100644
+--- a/GmProject/scripts/block_load_model_file/block_load_model_file.gml
++++ b/GmProject/scripts/block_load_model_file/block_load_model_file.gml
+@@ -196,6 +196,19 @@ function block_load_model_file(fname, res = null)
+ 							if (is_real(curmap[?"mineimator_color"]))
+ 								face_custom_color[f] = curmap[?"mineimator_color"]
+ 
++							// Imported furniture atlases can contain different material types.
++							face_custom_depth[f] = -1
++							if (is_string(curmap[?"mineimator_render_type"]))
++							{
++								switch (curmap[?"mineimator_render_type"])
++								{
++									case "SOLID": face_custom_depth[f] = e_block_depth.DEPTH0; break;
++									case "CUTOUT":
++									case "CUTOUT_MIPPED": face_custom_depth[f] = e_block_depth.DEPTH1; break;
++									case "TRANSLUCENT": face_custom_depth[f] = e_block_depth.DEPTH2; break;
++								}
++							}
++
+ 							// Rotation
+ 							face_rotation[f] = 0
+ 							if (is_real(curmap[?"rotation"]))
+diff --git a/GmProject/scripts/block_load_render_model/block_load_render_model.gml b/GmProject/scripts/block_load_render_model/block_load_render_model.gml
+index 23c7c6f..e25d9ae 100644
+--- a/GmProject/scripts/block_load_render_model/block_load_render_model.gml
++++ b/GmProject/scripts/block_load_render_model/block_load_render_model.gml
+@@ -548,6 +548,10 @@ function block_load_render_model(model, rot, uvlock, opaque, wei, res = null)
+ 							}
+ 						}
+ 						
++						// Respect the original furniture material instead of the shared atlas depth.
++						if (elem.face_custom_depth[f] >= 0)
++							face_depth[nd] = elem.face_custom_depth[f]
++
+ 						// Apply to UV
+ 						for (var t = 0; t < 4; t++)
+ 							face_uv[nd, t] = vec2_div(point2D_add(face_uv[nd, t], texpos), texsize)

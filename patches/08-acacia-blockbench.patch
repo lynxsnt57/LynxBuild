@@ -1,0 +1,278 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index fd2930e..6237ca8 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -4,6 +4,11 @@
+ 
+ #include <QBuffer>
+ #include <QDialog>
++#include <QFileDialog>
++#include <QMessageBox>
++#include <QProcess>
++#include <QPushButton>
++#include <QUuid>
+ #include <QDialogButtonBox>
+ #include <QLabel>
+ #include <QLineEdit>
+@@ -373,8 +378,66 @@ namespace CppProject
+ 		return drawnFaces ? result : QImage();
+ 	}
+ 
++	// Export a standalone Blockbench Java-block project with embedded PNG copies.
++	static QString mod_make_blockbench_project(const QString& modelFile)
++	{
++		QFile input(modelFile); if (!input.open(QIODevice::ReadOnly)) return "";
++		QJsonDocument parsed = QJsonDocument::fromJson(input.readAll());
++		if (!parsed.isObject()) return "";
++		QJsonObject model = parsed.object(), refs = model.value("textures").toObject();
++		QJsonArray inputElements = model.value("elements").toArray();
++		if (inputElements.isEmpty() || inputElements.size() > 1024) return "";
++		QDir dir = QFileInfo(modelFile).absoluteDir();
++		QJsonArray textures, elements, outliner; QMap<QString,int> index;
++		for (auto it=refs.begin(); it!=refs.end(); ++it) {
++			QString name=it.value().toString();
++			if (!QRegularExpression("^mod_texture_[0-9]+$").match(name).hasMatch()) return "";
++			QFile image(dir.filePath(name+".png"));
++			if (!image.open(QIODevice::ReadOnly) || image.size() > 8388608) return "";
++			QByteArray bytes=image.readAll();
++			QJsonObject texture;
++			texture.insert("name", name+".png"); texture.insert("id", QString::number(textures.size()));
++			texture.insert("uuid", QUuid::createUuid().toString(QUuid::WithoutBraces));
++			texture.insert("source", "data:image/png;base64,"+QString::fromLatin1(bytes.toBase64()));
++			texture.insert("internal", true); index.insert(it.key(), textures.size()); textures.append(texture);
++		}
++		const QStringList sides={"north","south","east","west","up","down"};
++		for (const QJsonValue& val : inputElements) {
++			QJsonObject e=val.toObject(), inFaces=e.value("faces").toObject(), faces;
++			for (const QString& side : sides) {
++				QJsonObject face;
++				if (!inFaces.contains(side)) { face.insert("texture", QJsonValue(QJsonValue::Null)); }
++				else {
++					QJsonObject in=inFaces.value(side).toObject(); QString ref=in.value("texture").toString();
++					if (!ref.startsWith('#') || !index.contains(ref.mid(1)) || in.value("uv").toArray().size()!=4) return "";
++					face.insert("texture", index.value(ref.mid(1))); face.insert("uv", in.value("uv"));
++					if (in.contains("rotation")) face.insert("rotation", in.value("rotation"));
++				}
++				faces.insert(side, face);
++			}
++			QString uuid=QUuid::createUuid().toString(QUuid::WithoutBraces);
++			QJsonObject cube; cube.insert("name",QString("part_%1").arg(elements.size()+1)); cube.insert("type","cube"); cube.insert("uuid",uuid);
++			cube.insert("from",e.value("from")); cube.insert("to",e.value("to")); cube.insert("faces",faces); cube.insert("box_uv",false);
++			if (e.contains("rotation")) {
++				QJsonObject r=e.value("rotation").toObject(); QString axis=r.value("axis").toString(); double a=r.value("angle").toDouble();
++				QJsonArray angles; angles.append(axis=="x"?a:0); angles.append(axis=="y"?a:0); angles.append(axis=="z"?a:0);
++				cube.insert("rotation",angles); cube.insert("rotation_axis",axis);
++				cube.insert("origin",r.contains("origin")?r.value("origin"):QJsonValue(QJsonArray{8,8,8}));
++				cube.insert("rescale",r.value("rescale").toBool());
++			}
++			elements.append(cube); outliner.append(uuid);
++		}
++		QJsonObject meta; meta.insert("format_version","4.10"); meta.insert("model_format","java_block"); meta.insert("box_uv",false);
++		QJsonObject resolution; resolution.insert("width",16); resolution.insert("height",16);
++		QJsonObject result; result.insert("meta",meta); result.insert("resolution",resolution); result.insert("elements",elements); result.insert("outliner",outliner); result.insert("textures",textures);
++		QString path=dir.filePath(QFileInfo(modelFile).completeBaseName()+".bbmodel");
++		QFile output(path); QByteArray data=QJsonDocument(result).toJson(QJsonDocument::Indented);
++		if (!output.open(QIODevice::WriteOnly | QIODevice::NewOnly) || output.write(data)!=data.size() || !output.flush()) return "";
++		return path;
++	}
++
+ 	// Experimental static Minecraft block model importer. Reads data only, never mod code.
+-	StringType mod_import_static_model(StringType jarPath)
++	StringType mod_import_static_model(StringType jarPath, StringType minecraftZipPath)
+ 	{
+ 		int zipError = 0;
+ 		std::string archiveName = jarPath.ToStdString();
+@@ -406,6 +469,30 @@ namespace CppProject
+ 			}
+ 			return zip_fclose(f) == 0;
+ 		};
++		// Read the currently selected Minecraft asset archive without extracting it.
++		std::string mcName = minecraftZipPath.ToStdString();
++		std::unique_ptr<zip_t, decltype(&zip_discard)> mcArchive(zip_open(mcName.c_str(), ZIP_RDONLY, &zipError), zip_discard);
++		QMap<QString, zip_uint64_t> mcEntries;
++		if (mcArchive) {
++			zip_int64_t n = zip_get_num_entries(mcArchive.get(), 0);
++			if (n < 0 || n > 100000) return "ERROR: Invalid Minecraft asset archive.";
++			for (zip_uint64_t i = 0; i < static_cast<zip_uint64_t>(n); ++i) {
++				const char* raw = zip_get_name(mcArchive.get(), i, 0);
++				if (!raw) return "ERROR: Invalid Minecraft asset index.";
++				QString name = QString::fromUtf8(raw);
++				if (mcEntries.contains(name)) return "ERROR: Duplicate Minecraft asset entries.";
++				mcEntries.insert(name, i);
++			}
++		}
++		auto readMc = [&mcArchive, &mcEntries](const QString& name, zip_uint64_t limit, QByteArray& out) -> bool {
++			if (!mcArchive || !mcEntries.contains(name)) return false;
++			zip_uint64_t index = mcEntries.value(name); zip_stat_t st; zip_stat_init(&st);
++			if (zip_stat_index(mcArchive.get(), index, 0, &st) != 0 || !(st.valid & ZIP_STAT_SIZE) || st.size > limit) return false;
++			zip_file_t* f = zip_fopen_index(mcArchive.get(), index, 0); if (!f) return false;
++			out.resize(static_cast<int>(st.size)); zip_uint64_t pos = 0;
++			while (pos < st.size) { zip_int64_t n = zip_fread(f, out.data()+pos, st.size-pos); if (n <= 0) { zip_fclose(f); return false; } pos += static_cast<zip_uint64_t>(n); }
++			return zip_fclose(f) == 0;
++		};
+ 		auto readJson = [&readEntry](const QString& path, QJsonObject& out) -> bool {
+ 			QByteArray bytes;
+ 			if (!readEntry(path, 1048576, bytes)) return false;
+@@ -439,7 +526,7 @@ namespace CppProject
+ 		if (models.isEmpty()) return "ERROR: No block model JSON files found in this JAR.";
+ 		if (models.size() > 10000) return "ERROR: Too many models in this JAR.";
+ 		models.sort(Qt::CaseInsensitive);
+-		auto prepare = [&resourcePath, &readJson, &readEntry, &entries](const QString& selected) -> StringType {
++		auto prepare = [&resourcePath, &readJson, &readEntry, &entries, &readMc, &mcEntries](const QString& selected) -> StringType {
+ 			QString current = selected;
+ 			QSet<QString> visited;
+ 			QList<QJsonObject> layers;
+@@ -473,7 +560,7 @@ namespace CppProject
+ 				for (const auto& x : a) if (!x.isDouble() || !std::isfinite(x.toDouble()) || std::abs(x.toDouble()) > 4096) return false;
+ 				return true;
+ 			};
+-			QSet<QString> needed;
++			QSet<QString> needed, tinted, plain;
+ 			for (const QJsonValue& value : elements) {
+ 				if (!value.isObject()) return "ERROR: Invalid geometry element.";
+ 				QJsonObject element = value.toObject();
+@@ -504,12 +591,17 @@ namespace CppProject
+ 						for (const QJsonValue& coord : face.value("uv").toArray())
+ 							if (coord.toDouble() < 0 || coord.toDouble() > 16) return "ERROR: Out-of-range UV is not supported yet.";
+ 					}
+-					if (face.contains("tintindex")) return "ERROR: Tinted faces are not supported yet.";
++					QString textureKey = face.value("texture").toString().mid(1);
++					if (face.contains("tintindex")) {
++						if (!face.value("tintindex").isDouble() || face.value("tintindex").toDouble() != 0) return "ERROR: This tint index is not supported yet.";
++						tinted.insert(textureKey);
++					} else plain.insert(textureKey);
+ 					if (face.contains("rotation") && (!face.value("rotation").isDouble() || (face.value("rotation").toDouble() != 0 && face.value("rotation").toDouble() != 90 && face.value("rotation").toDouble() != 180 && face.value("rotation").toDouble() != 270))) return "ERROR: Unsupported UV rotation.";
+ 					needed.insert(face.value("texture").toString().mid(1));
+ 				}
+ 			}
+ 			if (needed.size() > 32) return "ERROR: Too many textures.";
++			for (const QString& key : tinted) if (plain.contains(key)) return "ERROR: Mixed tinted and plain faces are not supported yet.";
+ 			QJsonObject localTextures;
+ 			QMap<QString, QByteArray> images;
+ 			int imageNo = 0;
+@@ -522,19 +614,56 @@ namespace CppProject
+ 					QString value = textureRefs.value(ref).toString();
+ 					if (value.startsWith('#')) { ref = value.mid(1); continue; }
+ 					QString path = resourcePath(value, "textures", ".png"); QByteArray bytes;
+-					if (path.isEmpty() || !readEntry(path, 8388608, bytes)) return "ERROR: Texture missing from JAR or too large (Minecraft/dependency assets are not supported yet).";
++					if (path.isEmpty()) return "ERROR: Invalid texture identifier.";
++					bool fromMinecraft = false;
++					if (entries.contains(path)) {
++						if (!readEntry(path, 8388608, bytes)) return "ERROR: Texture is invalid or too large.";
++					} else {
++						if (!path.startsWith("assets/minecraft/") || !readMc(path, 8388608, bytes)) return "ERROR: Texture missing from mod and current Minecraft assets.";
++						fromMinecraft = true;
++					}
+ 					totalImageBytes += bytes.size();
+ 					if (totalImageBytes > 33554432) return "ERROR: Total textures are too large.";
+-					// Reject animated and non-square atlases: the current block importer pads them.
+-					if (entries.contains(path + ".mcmeta")) return "ERROR: Animated textures are not supported yet.";
++					QString metaPath = path + ".mcmeta"; QByteArray metaBytes;
++					bool hasMeta = fromMinecraft ? mcEntries.contains(metaPath) : entries.contains(metaPath);
++					if (hasMeta) {
++						bool ok = fromMinecraft ? readMc(metaPath, 262144, metaBytes) : readEntry(metaPath, 262144, metaBytes);
++						QJsonParseError err; QJsonDocument meta = QJsonDocument::fromJson(metaBytes, &err);
++						if (!ok || err.error != QJsonParseError::NoError || !meta.isObject()) return "ERROR: Invalid texture metadata.";
++						if (meta.object().contains("animation")) return "ERROR: Animated textures are not supported yet.";
++					}
+ 					QBuffer buffer(&bytes); if (!buffer.open(QIODevice::ReadOnly)) return "ERROR: Invalid texture.";
+ 					QImageReader reader(&buffer, "png"); QSize size = reader.size();
+-					if (!size.isValid() || size.width() != size.height() || size.width() > 4096 || size.height() > 4096 || reader.read().isNull()) return "ERROR: Unsupported or invalid PNG texture (square textures only).";
++					if (!size.isValid() || size.width() != size.height() || size.width() > 4096 || size.height() > 4096) return "ERROR: Unsupported PNG dimensions.";
++					QImage image = reader.read(); if (image.isNull()) return "ERROR: Invalid PNG texture.";
++					if (tinted.contains(key)) {
++						if (path != "assets/minecraft/textures/block/acacia_leaves.png") return "ERROR: This tint source is not supported yet.";
++						QByteArray colorBytes; if (!readMc("assets/minecraft/textures/colormap/foliage.png", 1048576, colorBytes)) return "ERROR: Minecraft foliage colormap is missing.";
++						QBuffer colorBuffer(&colorBytes); colorBuffer.open(QIODevice::ReadOnly); QImageReader colorReader(&colorBuffer, "png");
++						if (colorReader.size() != QSize(256,256)) return "ERROR: Invalid foliage colormap.";
++						QImage colors = colorReader.read(); if (colors.isNull()) return "ERROR: Invalid foliage colormap.";
++						QColor tint = colors.pixelColor(50,173); // 26.2 plains foliage; an approximation for standalone models.
++						image = image.convertToFormat(QImage::Format_ARGB32);
++						for (int y=0; y<image.height(); ++y) for (int x=0; x<image.width(); ++x) {
++							QColor px = image.pixelColor(x,y);
++							px.setRgb(px.red()*tint.red()/255, px.green()*tint.green()/255, px.blue()*tint.blue()/255, px.alpha()); image.setPixelColor(x,y,px);
++						}
++						bytes.clear(); QBuffer out(&bytes); if (!out.open(QIODevice::WriteOnly) || !image.save(&out,"PNG")) return "ERROR: Cannot encode tinted texture.";
++					}
+ 					QString local = QString("mod_texture_%1").arg(imageNo++);
+ 					images.insert(local + ".png", bytes); localTextures.insert(key, local);
+ 					break;
+ 				}
+ 			}
++			// Tint is baked into a copied texture; keep the original JAR untouched.
++			if (!tinted.isEmpty()) {
++				for (int i=0; i<elements.size(); ++i) {
++					QJsonObject element = elements[i].toObject(); QJsonObject faces = element.value("faces").toObject();
++					for (auto it=faces.begin(); it!=faces.end(); ++it) { QJsonObject f=it.value().toObject(); f.remove("tintindex"); it.value()=f; }
++					element.insert("faces", faces); elements[i]=element;
++				}
++				merged.insert("elements", elements);
++			}
+ 			merged.insert("textures", localTextures);
+ 			QTemporaryDir temp(QDir::tempPath() + "/MineimatorModModel-XXXXXX");
+ 			if (!temp.isValid()) return "ERROR: Cannot create temporary model directory.";
+@@ -576,7 +705,8 @@ namespace CppProject
+ 		preview.setMinimumSize(300, 300);
+ 		preview.setStyleSheet("QLabel { background: #20242b; color: #b8c1d0; border: 1px solid #414954; border-radius: 4px; }");
+ 		right->addWidget(&preview, 1);
+-		QLabel previewNote("Preview is approximate; final appearance may differ."); previewNote.setWordWrap(true); right->addWidget(&previewNote);
++		QLabel previewNote("Preview is approximate. Acacia leaves use an approximate plains tint."); previewNote.setWordWrap(true); right->addWidget(&previewNote);
++		QPushButton openBlockbench("Open copy in Blockbench..."); right->addWidget(&openBlockbench);
+ 		QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); layout.addWidget(&buttons);
+ 		QTimer previewTimer; previewTimer.setSingleShot(true); previewTimer.setInterval(200);
+ 		QObject::connect(&list, &QListWidget::currentItemChanged, &previewTimer, [&preview, &previewTimer](QListWidgetItem* item, QListWidgetItem*) {
+@@ -606,6 +736,25 @@ namespace CppProject
+ 			}
+ 			list.setCurrentItem(first);
+ 		});
++		QObject::connect(&openBlockbench, &QPushButton::clicked, &dialog, [&dialog, &list, &prepare]() {
++			QListWidgetItem* item = list.currentItem();
++			if (!item || item->isHidden()) { QMessageBox::information(&dialog, "Blockbench", "Select a model first."); return; }
++			QString exe = QFileDialog::getOpenFileName(&dialog, "Select installed Blockbench executable", "", "Applications (*.exe)");
++			if (exe.isEmpty()) return;
++			QString modelPath = prepare(item->text()).QStr();
++			if (modelPath.startsWith("ERROR:")) { QMessageBox::warning(&dialog, "Blockbench", modelPath); return; }
++			QFileInfo info(modelPath); QDir folder=info.absoluteDir();
++			QString bbPath=mod_make_blockbench_project(modelPath);
++			if (bbPath.isEmpty()) {
++				if (folder.dirName().startsWith("MineimatorModModel-")) folder.removeRecursively();
++				QMessageBox::warning(&dialog, "Blockbench", "Cannot export this model to Blockbench. Explicit face UVs are required."); return;
++			}
++			if (!QProcess::startDetached(exe, QStringList{bbPath}, folder.absolutePath())) {
++				if (folder.dirName().startsWith("MineimatorModModel-")) folder.removeRecursively();
++				QMessageBox::warning(&dialog, "Blockbench", "Could not start Blockbench. Check the selected program."); return;
++			}
++			QMessageBox::information(&dialog, "Blockbench", "A temporary copy was opened. In Blockbench use Save As to keep your changes; they are not automatically imported back.");
++		});
+ 		QObject::connect(&buttons, &QDialogButtonBox::accepted, &dialog, [&dialog, &list]() {
+ 			if (list.currentItem() && !list.currentItem()->isHidden()) dialog.accept();
+ 		});
+diff --git a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+index 02e4a9c..9378506 100644
+--- a/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
++++ b/GmProject/scripts/bench_draw_settings/bench_draw_settings.gml
+@@ -79,7 +79,7 @@ function bench_draw_settings(bx, by, bw, bh)
+ 		dy += 40
+ 		if (draw_button_label("benchmodsmodel", dx, dy, dw, icons.MODEL, e_button.SECONDARY, null, e_anchor.LEFT, bench_mods_path = ""))
+ 		{
+-			var prepared_model = mod_import_static_model(bench_mods_path)
++			var prepared_model = mod_import_static_model(bench_mods_path, load_assets_zip_file)
+ 			if (prepared_model = "")
+ 			{
+ 				// Selection cancelled.
+diff --git a/GmProject/scripts/util_cpp/util_cpp.gml b/GmProject/scripts/util_cpp/util_cpp.gml
+index 777a662..2e6e179 100644
+--- a/GmProject/scripts/util_cpp/util_cpp.gml
++++ b/GmProject/scripts/util_cpp/util_cpp.gml
+@@ -432,9 +432,9 @@ function mod_export_demo_chair(filename)
+ 	return "ERROR: C++ build required."
+ }
+ 
+-/// CppSeparate StringType mod_import_static_model(StringType)
++/// CppSeparate StringType mod_import_static_model(StringType, StringType)
+ /// Select and prepare a supported static block model from a Fabric JAR.
+-function mod_import_static_model(filename)
++function mod_import_static_model(filename, minecraft_assets_zip)
+ {
+ 	return "ERROR: C++ build required."
+ }

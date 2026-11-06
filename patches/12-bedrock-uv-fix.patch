@@ -1,0 +1,44 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index ac3c475..2123044 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -527,7 +527,12 @@ namespace CppProject
+ 				double d=std::floor(size[2].toDouble()+0.000001);
+ 				shape.insert("uv",QJsonArray{uv[0].toDouble()+d,uv[1].toDouble()+d});
+ 				if(inf!=0) shape.insert("inflate",inf);
+-				if(c.value("mirror").isBool()?c.value("mirror").toBool():b.value("mirror").toBool()) shape.insert("texture_mirror",true);
++				// Bedrock/Blockbench and Mine-imator use opposite box face labels.
++				// A 180-degree UV remap exchanges both face pairs; invert the X
++				// mirror flag so Bedrock's own mirrored UVs are preserved.
++				bool bedrockMirror=c.value("mirror").isBool()?c.value("mirror").toBool():b.value("mirror").toBool();
++				shape.insert("texture_mirror",!bedrockMirror);
++				shape.insert("texture_mirror_y",true);
+ 				if(rotated) {
+ 					QString synthetic="__mi_cube_"+QString::number(visited.size())+"_"+QString::number(i);
+ 					while(byName.contains(synthetic) || visited.contains(synthetic)) synthetic+="_";
+diff --git a/GmProject/scripts/model_shape_generate_block/model_shape_generate_block.gml b/GmProject/scripts/model_shape_generate_block/model_shape_generate_block.gml
+index 6ccd10c..74ca0ec 100644
+--- a/GmProject/scripts/model_shape_generate_block/model_shape_generate_block.gml
++++ b/GmProject/scripts/model_shape_generate_block/model_shape_generate_block.gml
+@@ -114,7 +114,7 @@ function model_shape_generate_block(bend)
+ 	{
+ 		// Switch north/south sides
+ 		var tmp1, tmp2, tmp3, tmp4;
+-		tmp1 = texsouth1; tmp2 = texsouth2; tmp3 = texsouth3; tmp4 = texsouth1;
++		tmp1 = texsouth1; tmp2 = texsouth2; tmp3 = texsouth3; tmp4 = texsouth4;
+ 		texsouth1 = texnorth2; texsouth2 = texnorth1; texsouth3 = texnorth4; texsouth4 = texnorth3;
+ 		texnorth1 = tmp2; texnorth2 = tmp1; texnorth3 = tmp4; texnorth4 = tmp3;
+ 		
+diff --git a/GmProject/scripts/model_shape_generate_block_vertex/model_shape_generate_block_vertex.gml b/GmProject/scripts/model_shape_generate_block_vertex/model_shape_generate_block_vertex.gml
+index a709bbb..86d1f91 100644
+--- a/GmProject/scripts/model_shape_generate_block_vertex/model_shape_generate_block_vertex.gml
++++ b/GmProject/scripts/model_shape_generate_block_vertex/model_shape_generate_block_vertex.gml
+@@ -116,7 +116,7 @@ function model_shape_generate_block_vertex(bend)
+ 	{
+ 		// Switch north/south sides
+ 		var tmp1, tmp2, tmp3, tmp4;
+-		tmp1 = texsouth1; tmp2 = texsouth2; tmp3 = texsouth3; tmp4 = texsouth1;
++		tmp1 = texsouth1; tmp2 = texsouth2; tmp3 = texsouth3; tmp4 = texsouth4;
+ 		texsouth1 = texnorth2; texsouth2 = texnorth1; texsouth3 = texnorth4; texsouth4 = texnorth3;
+ 		texnorth1 = tmp2; texnorth2 = tmp1; texnorth3 = tmp4; texnorth4 = tmp3;
+ 		

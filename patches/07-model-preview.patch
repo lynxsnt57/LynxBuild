@@ -1,0 +1,442 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 14d1d4b..fd2930e 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -9,6 +9,16 @@
+ #include <QLineEdit>
+ #include <QListWidget>
+ #include <QVBoxLayout>
++#include <QHBoxLayout>
++#include <QPainter>
++#include <QPainterPath>
++#include <QPolygonF>
++#include <QColor>
++#include <QTimer>
++#include <QPixmap>
++#include <QVector3D>
++#include <QTransform>
++#include <algorithm>
+ #include <QSet>
+ #include <QMap>
+ #include <memory>
+@@ -240,6 +250,129 @@ namespace CppProject
+ 		return outputPath;
+ 	}
+ 
++	// Lightweight orthographic thumbnail for the model picker; it is not the
++	// application renderer. The actual imported model uses Mine-imator's renderer.
++	static QImage mod_render_preview(const QString& modelFile)
++	{
++		QFile file(modelFile);
++		if (!file.open(QIODevice::ReadOnly)) return QImage();
++		QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
++		if (!doc.isObject()) return QImage();
++		QJsonObject model = doc.object();
++		QJsonArray elements = model.value("elements").toArray();
++		QJsonObject textures = model.value("textures").toObject();
++		if (elements.isEmpty() || elements.size() > 1024) return QImage();
++		QMap<QString, QImage> tex;
++		QDir dir = QFileInfo(modelFile).absoluteDir();
++		qint64 totalPixels = 0;
++		for (auto it = textures.begin(); it != textures.end(); ++it) {
++			QString name = it.value().toString();
++			if (!QRegularExpression("^mod_texture_[0-9]+$").match(name).hasMatch()) return QImage();
++			QImageReader previewReader(dir.filePath(name + ".png"), "png");
++			QSize size = previewReader.size();
++			if (!size.isValid() || size.width() > 2048 || size.height() > 2048) return QImage();
++			totalPixels += qint64(size.width()) * size.height();
++			if (totalPixels > 8388608) return QImage();
++			QImage image = previewReader.read();
++			if (image.isNull()) return QImage();
++			tex.insert(it.key(), image);
++		}
++		struct Face { QVector<QVector3D> points; QPolygonF uv; QImage image; double depth; };
++		QVector<Face> faces;
++		const double yaw = 40.0 * 3.141592653589793 / 180.0, elevation = 25.0 * 3.141592653589793 / 180.0;
++		const QVector3D right(std::cos(yaw), 0, -std::sin(yaw));
++		const QVector3D view(std::sin(yaw)*std::cos(elevation), std::sin(elevation), std::cos(yaw)*std::cos(elevation));
++		const QVector3D up = QVector3D::crossProduct(view, right);
++		auto vector = [](const QJsonValue& v, const QVector3D& fallback) -> QVector3D {
++			if (!v.isArray() || v.toArray().size() != 3) return fallback;
++			QJsonArray a = v.toArray(); return QVector3D(a[0].toDouble(), a[1].toDouble(), a[2].toDouble());
++		};
++		for (const QJsonValue& v : elements) {
++			QJsonObject e = v.toObject();
++			QVector3D a = vector(e.value("from"), {}), b = vector(e.value("to"), {});
++			float x=a.x(), y=a.y(), z=a.z(), X=b.x(), Y=b.y(), Z=b.z();
++			QMap<QString, QVector<QVector3D>> geometry;
++			geometry["north"] = {{X,Y,z},{x,Y,z},{x,y,z},{X,y,z}};
++			geometry["south"] = {{x,Y,Z},{X,Y,Z},{X,y,Z},{x,y,Z}};
++			geometry["east"]  = {{X,Y,Z},{X,Y,z},{X,y,z},{X,y,Z}};
++			geometry["west"]  = {{x,Y,z},{x,Y,Z},{x,y,Z},{x,y,z}};
++			geometry["up"]    = {{x,Y,z},{X,Y,z},{X,Y,Z},{x,Y,Z}};
++			geometry["down"]  = {{x,y,Z},{X,y,Z},{X,y,z},{x,y,z}};
++			QMap<QString, QVector3D> normals = {{"north",{0,0,-1}},{"south",{0,0,1}},{"east",{1,0,0}},{"west",{-1,0,0}},{"up",{0,1,0}},{"down",{0,-1,0}}};
++			QJsonObject rotation = e.value("rotation").toObject();
++			QString axis = rotation.value("axis").toString();
++			double angle = rotation.value("angle").toDouble() * 3.141592653589793 / 180.0;
++			double c = std::cos(angle), s = std::sin(angle);
++			QVector3D origin = vector(rotation.value("origin"), {8,8,8});
++			auto rotate = [axis,c,s](QVector3D p) -> QVector3D {
++				if (axis == "x") return {p.x(), float(c*p.y()-s*p.z()), float(s*p.y()+c*p.z())};
++				if (axis == "y") return {float(c*p.x()+s*p.z()), p.y(), float(-s*p.x()+c*p.z())};
++				if (axis == "z") return {float(c*p.x()-s*p.y()), float(s*p.x()+c*p.y()), p.z()};
++				return p;
++			};
++			QJsonObject namedFaces = e.value("faces").toObject();
++			for (auto it = namedFaces.begin(); it != namedFaces.end(); ++it) {
++				QString name = it.key();
++				if (!geometry.contains(name)) continue;
++				QVector3D normal = rotate(normals.value(name));
++				if (QVector3D::dotProduct(normal, view) <= 0.0001) continue;
++				QJsonObject f = it.value().toObject();
++				QString ref = f.value("texture").toString();
++				if (!ref.startsWith('#') || !tex.contains(ref.mid(1))) return QImage();
++				QImage image = tex.value(ref.mid(1));
++				QJsonArray uv = f.value("uv").toArray();
++				if (uv.size() != 4) return QImage(); // Don't guess implicit UV in the thumbnail.
++				double u=uv[0].toDouble()*image.width()/16., w=uv[2].toDouble()*image.width()/16.;
++				double v0=uv[1].toDouble()*image.height()/16., v1=uv[3].toDouble()*image.height()/16.;
++				QPolygonF source; source << QPointF(u,v0) << QPointF(w,v0) << QPointF(w,v1) << QPointF(u,v1);
++				int turns = int(f.value("rotation").toDouble()) / 90;
++				for (int i = 0; i < turns; ++i) source.prepend(source.takeLast());
++				QVector<QVector3D> points = geometry.value(name);
++				double depth = 0;
++				for (QVector3D& p : points) {
++					p -= origin;
++					if (rotation.value("rescale").toBool() && std::abs(c) > 0.0001) {
++						if (axis != "x") p.setX(p.x()/c);
++						if (axis != "y") p.setY(p.y()/c);
++						if (axis != "z") p.setZ(p.z()/c);
++					}
++					p = rotate(p) + origin;
++					depth += QVector3D::dotProduct(p, view);
++				}
++				faces.append({points, source, image, depth / 4.});
++			}
++		}
++		if (faces.isEmpty()) return QImage();
++		double minX=1e30,maxX=-1e30,minY=1e30,maxY=-1e30;
++		for (const Face& f : faces) for (const QVector3D& p : f.points) {
++			double x=QVector3D::dotProduct(p,right), y=QVector3D::dotProduct(p,up);
++			minX=std::min(minX,x); maxX=std::max(maxX,x); minY=std::min(minY,y); maxY=std::max(maxY,y);
++		}
++		if (maxX-minX < .0001 || maxY-minY < .0001) return QImage();
++		const int width=400, height=360;
++		double scale = std::min(310.0/(maxX-minX), 280.0/(maxY-minY));
++		std::sort(faces.begin(), faces.end(), [](const Face& a,const Face& b){ return a.depth < b.depth; });
++		QImage result(width, height, QImage::Format_ARGB32_Premultiplied);
++		result.fill(QColor("#20242b"));
++		QPainter painter(&result);
++		painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
++		int drawnFaces = 0;
++		for (const Face& f : faces) {
++			QPolygonF target;
++			for (const QVector3D& p : f.points) {
++				double x=QVector3D::dotProduct(p,right), y=QVector3D::dotProduct(p,up);
++				target << QPointF(width/2.0+(x-(minX+maxX)/2)*scale, height/2.0-(y-(minY+maxY)/2)*scale);
++			}
++			QTransform transform;
++			if (!QTransform::quadToQuad(f.uv, target, transform)) continue;
++			QPainterPath clip; clip.addPolygon(target); clip.closeSubpath();
++			painter.save(); painter.setClipPath(clip); painter.setWorldTransform(transform); painter.drawImage(QPointF(0,0), f.image); painter.restore();
++			++drawnFaces;
++		}
++		painter.end();
++		return drawnFaces ? result : QImage();
++	}
++
+ 	// Experimental static Minecraft block model importer. Reads data only, never mod code.
+ 	StringType mod_import_static_model(StringType jarPath)
+ 	{
+@@ -306,9 +439,121 @@ namespace CppProject
+ 		if (models.isEmpty()) return "ERROR: No block model JSON files found in this JAR.";
+ 		if (models.size() > 10000) return "ERROR: Too many models in this JAR.";
+ 		models.sort(Qt::CaseInsensitive);
++		auto prepare = [&resourcePath, &readJson, &readEntry, &entries](const QString& selected) -> StringType {
++			QString current = selected;
++			QSet<QString> visited;
++			QList<QJsonObject> layers;
++			for (int depth = 0; ; ++depth) {
++				if (depth >= 32 || visited.contains(current)) return "ERROR: Model parent cycle or depth limit.";
++				visited.insert(current);
++				QString path = resourcePath(current, "models", ".json");
++				QJsonObject layer;
++				if (path.isEmpty() || !readJson(path, layer)) return "ERROR: Model parent missing from JAR or invalid (Minecraft/dependency assets are not supported yet).";
++				if (layer.contains("loader")) return "ERROR: This model uses a custom loader; not supported yet.";
++				layers.append(layer);
++				if (!layer.contains("parent")) break;
++				if (!layer.value("parent").isString()) return "ERROR: Invalid model parent.";
++				current = layer.value("parent").toString();
++			}
++			QJsonObject merged, textureRefs;
++			for (auto it = layers.crbegin(); it != layers.crend(); ++it) {
++				QJsonObject obj = *it;
++				if (obj.contains("textures") && !obj.value("textures").isObject()) return "ERROR: Unsupported texture map.";
++				QJsonObject textures = obj.value("textures").toObject();
++				for (auto t = textures.begin(); t != textures.end(); ++t) textureRefs.insert(t.key(), t.value());
++				for (auto p = obj.begin(); p != obj.end(); ++p)
++					if (p.key() != "parent" && p.key() != "textures") merged.insert(p.key(), p.value());
++			}
++			if (!merged.value("elements").isArray()) return "ERROR: This model has no static geometry.";
++			QJsonArray elements = merged.value("elements").toArray();
++			if (elements.isEmpty() || elements.size() > 1024) return "ERROR: Empty or excessively complex geometry.";
++			auto numbers = [](const QJsonValue& v, int n) -> bool {
++				if (!v.isArray()) return false;
++				QJsonArray a = v.toArray(); if (a.size() != n) return false;
++				for (const auto& x : a) if (!x.isDouble() || !std::isfinite(x.toDouble()) || std::abs(x.toDouble()) > 4096) return false;
++				return true;
++			};
++			QSet<QString> needed;
++			for (const QJsonValue& value : elements) {
++				if (!value.isObject()) return "ERROR: Invalid geometry element.";
++				QJsonObject element = value.toObject();
++				if (!numbers(element.value("from"), 3) || !numbers(element.value("to"), 3) || !element.value("faces").isObject()) return "ERROR: Unsupported geometry.";
++				// Mine-imator's block loader supports the standard Minecraft single-axis
++				// rotation with an origin and optional perpendicular rescaling.
++				if (element.contains("rotation")) {
++					if (!element.value("rotation").isObject()) return "ERROR: Invalid element rotation.";
++					QJsonObject rotation = element.value("rotation").toObject();
++					QString axis = rotation.value("axis").toString();
++					if (axis != "x" && axis != "y" && axis != "z") return "ERROR: Unsupported rotation axis.";
++					if (!rotation.value("angle").isDouble()) return "ERROR: Invalid rotation angle.";
++					double angle = rotation.value("angle").toDouble();
++					if (!std::isfinite(angle) || (angle != -45 && angle != -22.5 && angle != 0 && angle != 22.5 && angle != 45)) return "ERROR: Unsupported rotation angle.";
++					if (rotation.contains("origin") && !numbers(rotation.value("origin"), 3)) return "ERROR: Invalid rotation origin.";
++					if (rotation.contains("rescale") && !rotation.value("rescale").isBool()) return "ERROR: Invalid rotation rescale flag.";
++				}
++				if (element.contains("shade") && element.value("shade").isBool() && !element.value("shade").toBool()) return "ERROR: Unshaded elements are not supported yet.";
++				QJsonObject faces = element.value("faces").toObject();
++				if (faces.isEmpty()) return "ERROR: Empty model faces.";
++				for (auto f = faces.begin(); f != faces.end(); ++f) {
++					if (f.key() != "north" && f.key() != "south" && f.key() != "east" && f.key() != "west" && f.key() != "up" && f.key() != "down") return "ERROR: Unsupported face direction.";
++					if (!f.value().isObject()) return "ERROR: Invalid face.";
++					QJsonObject face = f.value().toObject();
++					if (!face.value("texture").isString() || !face.value("texture").toString().startsWith('#')) return "ERROR: Unsupported face texture reference.";
++					if (face.contains("uv")) {
++						if (!numbers(face.value("uv"), 4)) return "ERROR: Unsupported face UV.";
++						for (const QJsonValue& coord : face.value("uv").toArray())
++							if (coord.toDouble() < 0 || coord.toDouble() > 16) return "ERROR: Out-of-range UV is not supported yet.";
++					}
++					if (face.contains("tintindex")) return "ERROR: Tinted faces are not supported yet.";
++					if (face.contains("rotation") && (!face.value("rotation").isDouble() || (face.value("rotation").toDouble() != 0 && face.value("rotation").toDouble() != 90 && face.value("rotation").toDouble() != 180 && face.value("rotation").toDouble() != 270))) return "ERROR: Unsupported UV rotation.";
++					needed.insert(face.value("texture").toString().mid(1));
++				}
++			}
++			if (needed.size() > 32) return "ERROR: Too many textures.";
++			QJsonObject localTextures;
++			QMap<QString, QByteArray> images;
++			int imageNo = 0;
++			qint64 totalImageBytes = 0;
++			for (const QString& key : needed) {
++				QString ref = key; QSet<QString> seen;
++				while (true) {
++					if (seen.contains(ref) || !textureRefs.value(ref).isString()) return "ERROR: Unresolved or cyclic texture reference.";
++					seen.insert(ref);
++					QString value = textureRefs.value(ref).toString();
++					if (value.startsWith('#')) { ref = value.mid(1); continue; }
++					QString path = resourcePath(value, "textures", ".png"); QByteArray bytes;
++					if (path.isEmpty() || !readEntry(path, 8388608, bytes)) return "ERROR: Texture missing from JAR or too large (Minecraft/dependency assets are not supported yet).";
++					totalImageBytes += bytes.size();
++					if (totalImageBytes > 33554432) return "ERROR: Total textures are too large.";
++					// Reject animated and non-square atlases: the current block importer pads them.
++					if (entries.contains(path + ".mcmeta")) return "ERROR: Animated textures are not supported yet.";
++					QBuffer buffer(&bytes); if (!buffer.open(QIODevice::ReadOnly)) return "ERROR: Invalid texture.";
++					QImageReader reader(&buffer, "png"); QSize size = reader.size();
++					if (!size.isValid() || size.width() != size.height() || size.width() > 4096 || size.height() > 4096 || reader.read().isNull()) return "ERROR: Unsupported or invalid PNG texture (square textures only).";
++					QString local = QString("mod_texture_%1").arg(imageNo++);
++					images.insert(local + ".png", bytes); localTextures.insert(key, local);
++					break;
++				}
++			}
++			merged.insert("textures", localTextures);
++			QTemporaryDir temp(QDir::tempPath() + "/MineimatorModModel-XXXXXX");
++			if (!temp.isValid()) return "ERROR: Cannot create temporary model directory.";
++			auto write = [&temp](const QString& name, const QByteArray& data) -> bool {
++				QFile file(temp.filePath(name));
++				return file.open(QIODevice::WriteOnly | QIODevice::NewOnly) && file.write(data) == data.size() && file.flush();
++			};
++			for (auto it = images.cbegin(); it != images.cend(); ++it)
++				if (!write(it.key(), it.value())) return "ERROR: Cannot save temporary texture.";
++			QString shortName = selected.section('/', -1).left(80);
++			QString outputName = shortName + "-" + QFileInfo(temp.path()).fileName().right(6) + ".json";
++			if (!write(outputName, QJsonDocument(merged).toJson(QJsonDocument::Indented))) return "ERROR: Cannot save temporary model.";
++			QString outputPath = temp.filePath(outputName);
++			temp.setAutoRemove(false);
++			return outputPath;
++		};
+ 		QDialog dialog;
+ 		dialog.setWindowTitle("Select a static mod model");
+-		dialog.resize(620, 550);
++		dialog.resize(1000, 570);
+ 		dialog.setStyleSheet(
+ 			"QDialog { background: #17191d; color: #e5e8ef; font-size: 13px; }"
+ 			"QLabel { color: #b8c1d0; padding: 5px; }"
+@@ -318,13 +563,40 @@ namespace CppProject
+ 			"QPushButton { background: #344c72; color: white; border: 1px solid #6286bc; border-radius: 4px; padding: 7px 18px; }"
+ 			"QPushButton:hover { background: #486a9c; }");
+ 		QVBoxLayout layout(&dialog);
+-		QLabel caption("Search model files. Some entries are parts, variants, or unsupported models.\nA 3D preview opens in the workbench after selection.");
++		QLabel caption("Select a model to see an experimental preview. Some entries are parts, variants, or unsupported models.");
+ 		caption.setWordWrap(true); layout.addWidget(&caption);
+-		QLineEdit search; search.setPlaceholderText("Search models..."); layout.addWidget(&search);
+-		QListWidget list; list.addItems(models); layout.addWidget(&list);
++		QHBoxLayout* body = new QHBoxLayout(); layout.addLayout(body);
++		QVBoxLayout* left = new QVBoxLayout(); body->addLayout(left, 3);
++		QLineEdit search; search.setPlaceholderText("Search models..."); left->addWidget(&search);
++		QListWidget list; list.addItems(models); left->addWidget(&list);
++		QVBoxLayout* right = new QVBoxLayout(); body->addLayout(right, 2);
++		QLabel previewTitle("Preview"); right->addWidget(&previewTitle);
++		QLabel preview("Select a model from the list");
++		preview.setAlignment(Qt::AlignCenter); preview.setWordWrap(true);
++		preview.setMinimumSize(300, 300);
++		preview.setStyleSheet("QLabel { background: #20242b; color: #b8c1d0; border: 1px solid #414954; border-radius: 4px; }");
++		right->addWidget(&preview, 1);
++		QLabel previewNote("Preview is approximate; final appearance may differ."); previewNote.setWordWrap(true); right->addWidget(&previewNote);
+ 		QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel); layout.addWidget(&buttons);
+-		list.setCurrentRow(0);
+-		QObject::connect(&search, &QLineEdit::textChanged, &dialog, [&list](const QString& text) {
++		QTimer previewTimer; previewTimer.setSingleShot(true); previewTimer.setInterval(200);
++		QObject::connect(&list, &QListWidget::currentItemChanged, &previewTimer, [&preview, &previewTimer](QListWidgetItem* item, QListWidgetItem*) {
++			previewTimer.stop(); preview.clear();
++			if (!item || item->isHidden()) { preview.setText("Select a model from the list"); return; }
++			preview.setText("Loading preview..."); previewTimer.start();
++		});
++		QObject::connect(&previewTimer, &QTimer::timeout, &dialog, [&list, &preview, &prepare]() {
++			QListWidgetItem* item = list.currentItem();
++			if (!item || item->isHidden()) { preview.setText("Select a model from the list"); return; }
++			QString path = prepare(item->text()).QStr();
++			if (path.startsWith("ERROR:")) { preview.setText(path); return; }
++			QImage image = mod_render_preview(path);
++			// Remove only the unique temporary folder created for this preview.
++			QFileInfo info(path); QDir parent = info.absoluteDir();
++			if (parent.dirName().startsWith("MineimatorModModel-")) parent.removeRecursively();
++			if (image.isNull()) { preview.setText("Preview unavailable for this model. You may still try importing it."); return; }
++			preview.setPixmap(QPixmap::fromImage(image));
++		});
++		QObject::connect(&search, &QLineEdit::textChanged, &list, [&list](const QString& text) {
+ 			QListWidgetItem* first = nullptr;
+ 			for (int i = 0; i < list.count(); ++i) {
+ 				QListWidgetItem* item = list.item(i);
+@@ -339,119 +611,8 @@ namespace CppProject
+ 		});
+ 		QObject::connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+ 		QObject::connect(&list, &QListWidget::itemDoubleClicked, &dialog, [&dialog](QListWidgetItem*) { dialog.accept(); });
+-		if (App->ExecDialog(&dialog) != QDialog::Accepted) return "";
+-		if (!list.currentItem()) return "";
+-		QString selected = list.currentItem()->text();
+-		QString current = selected;
+-		QSet<QString> visited;
+-		QList<QJsonObject> layers;
+-		for (int depth = 0; ; ++depth) {
+-			if (depth >= 32 || visited.contains(current)) return "ERROR: Model parent cycle or depth limit.";
+-			visited.insert(current);
+-			QString path = resourcePath(current, "models", ".json");
+-			QJsonObject layer;
+-			if (path.isEmpty() || !readJson(path, layer)) return "ERROR: Model parent missing from JAR or invalid (Minecraft/dependency assets are not supported yet).";
+-			if (layer.contains("loader")) return "ERROR: This model uses a custom loader; not supported yet.";
+-			layers.append(layer);
+-			if (!layer.contains("parent")) break;
+-			if (!layer.value("parent").isString()) return "ERROR: Invalid model parent.";
+-			current = layer.value("parent").toString();
+-		}
+-		QJsonObject merged, textureRefs;
+-		for (auto it = layers.crbegin(); it != layers.crend(); ++it) {
+-			QJsonObject obj = *it;
+-			if (obj.contains("textures") && !obj.value("textures").isObject()) return "ERROR: Unsupported texture map.";
+-			QJsonObject textures = obj.value("textures").toObject();
+-			for (auto t = textures.begin(); t != textures.end(); ++t) textureRefs.insert(t.key(), t.value());
+-			for (auto p = obj.begin(); p != obj.end(); ++p)
+-				if (p.key() != "parent" && p.key() != "textures") merged.insert(p.key(), p.value());
+-		}
+-		if (!merged.value("elements").isArray()) return "ERROR: This model has no static geometry.";
+-		QJsonArray elements = merged.value("elements").toArray();
+-		if (elements.isEmpty() || elements.size() > 1024) return "ERROR: Empty or excessively complex geometry.";
+-		auto numbers = [](const QJsonValue& v, int n) -> bool {
+-			if (!v.isArray()) return false;
+-			QJsonArray a = v.toArray(); if (a.size() != n) return false;
+-			for (const auto& x : a) if (!x.isDouble() || !std::isfinite(x.toDouble()) || std::abs(x.toDouble()) > 4096) return false;
+-			return true;
+-		};
+-		QSet<QString> needed;
+-		for (const QJsonValue& value : elements) {
+-			if (!value.isObject()) return "ERROR: Invalid geometry element.";
+-			QJsonObject element = value.toObject();
+-			if (!numbers(element.value("from"), 3) || !numbers(element.value("to"), 3) || !element.value("faces").isObject()) return "ERROR: Unsupported geometry.";
+-			// Mine-imator's block loader supports the standard Minecraft single-axis
+-			// rotation with an origin and optional perpendicular rescaling.
+-			if (element.contains("rotation")) {
+-				if (!element.value("rotation").isObject()) return "ERROR: Invalid element rotation.";
+-				QJsonObject rotation = element.value("rotation").toObject();
+-				QString axis = rotation.value("axis").toString();
+-				if (axis != "x" && axis != "y" && axis != "z") return "ERROR: Unsupported rotation axis.";
+-				if (!rotation.value("angle").isDouble()) return "ERROR: Invalid rotation angle.";
+-				double angle = rotation.value("angle").toDouble();
+-				if (!std::isfinite(angle) || (angle != -45 && angle != -22.5 && angle != 0 && angle != 22.5 && angle != 45)) return "ERROR: Unsupported rotation angle.";
+-				if (rotation.contains("origin") && !numbers(rotation.value("origin"), 3)) return "ERROR: Invalid rotation origin.";
+-				if (rotation.contains("rescale") && !rotation.value("rescale").isBool()) return "ERROR: Invalid rotation rescale flag.";
+-			}
+-			if (element.contains("shade") && element.value("shade").isBool() && !element.value("shade").toBool()) return "ERROR: Unshaded elements are not supported yet.";
+-			QJsonObject faces = element.value("faces").toObject();
+-			if (faces.isEmpty()) return "ERROR: Empty model faces.";
+-			for (auto f = faces.begin(); f != faces.end(); ++f) {
+-				if (f.key() != "north" && f.key() != "south" && f.key() != "east" && f.key() != "west" && f.key() != "up" && f.key() != "down") return "ERROR: Unsupported face direction.";
+-				if (!f.value().isObject()) return "ERROR: Invalid face.";
+-				QJsonObject face = f.value().toObject();
+-				if (!face.value("texture").isString() || !face.value("texture").toString().startsWith('#')) return "ERROR: Unsupported face texture reference.";
+-				if (face.contains("uv")) {
+-					if (!numbers(face.value("uv"), 4)) return "ERROR: Unsupported face UV.";
+-					for (const QJsonValue& coord : face.value("uv").toArray())
+-						if (coord.toDouble() < 0 || coord.toDouble() > 16) return "ERROR: Out-of-range UV is not supported yet.";
+-				}
+-				if (face.contains("tintindex")) return "ERROR: Tinted faces are not supported yet.";
+-				if (face.contains("rotation") && (!face.value("rotation").isDouble() || (face.value("rotation").toDouble() != 0 && face.value("rotation").toDouble() != 90 && face.value("rotation").toDouble() != 180 && face.value("rotation").toDouble() != 270))) return "ERROR: Unsupported UV rotation.";
+-				needed.insert(face.value("texture").toString().mid(1));
+-			}
+-		}
+-		if (needed.size() > 32) return "ERROR: Too many textures.";
+-		QJsonObject localTextures;
+-		QMap<QString, QByteArray> images;
+-		int imageNo = 0;
+-		qint64 totalImageBytes = 0;
+-		for (const QString& key : needed) {
+-			QString ref = key; QSet<QString> seen;
+-			while (true) {
+-				if (seen.contains(ref) || !textureRefs.value(ref).isString()) return "ERROR: Unresolved or cyclic texture reference.";
+-				seen.insert(ref);
+-				QString value = textureRefs.value(ref).toString();
+-				if (value.startsWith('#')) { ref = value.mid(1); continue; }
+-				QString path = resourcePath(value, "textures", ".png"); QByteArray bytes;
+-				if (path.isEmpty() || !readEntry(path, 8388608, bytes)) return "ERROR: Texture missing from JAR or too large (Minecraft/dependency assets are not supported yet).";
+-				totalImageBytes += bytes.size();
+-				if (totalImageBytes > 33554432) return "ERROR: Total textures are too large.";
+-				// Reject animated and non-square atlases: the current block importer pads them.
+-				if (entries.contains(path + ".mcmeta")) return "ERROR: Animated textures are not supported yet.";
+-				QBuffer buffer(&bytes); if (!buffer.open(QIODevice::ReadOnly)) return "ERROR: Invalid texture.";
+-				QImageReader reader(&buffer, "png"); QSize size = reader.size();
+-				if (!size.isValid() || size.width() != size.height() || size.width() > 4096 || size.height() > 4096 || reader.read().isNull()) return "ERROR: Unsupported or invalid PNG texture (square textures only).";
+-				QString local = QString("mod_texture_%1").arg(imageNo++);
+-				images.insert(local + ".png", bytes); localTextures.insert(key, local);
+-				break;
+-			}
+-		}
+-		merged.insert("textures", localTextures);
+-		QTemporaryDir temp(QDir::tempPath() + "/MineimatorModModel-XXXXXX");
+-		if (!temp.isValid()) return "ERROR: Cannot create temporary model directory.";
+-		auto write = [&temp](const QString& name, const QByteArray& data) -> bool {
+-			QFile file(temp.filePath(name));
+-			return file.open(QIODevice::WriteOnly | QIODevice::NewOnly) && file.write(data) == data.size() && file.flush();
+-		};
+-		for (auto it = images.cbegin(); it != images.cend(); ++it)
+-			if (!write(it.key(), it.value())) return "ERROR: Cannot save temporary texture.";
+-		QString shortName = selected.section('/', -1).left(80);
+-		QString outputName = shortName + "-" + QFileInfo(temp.path()).fileName().right(6) + ".json";
+-		if (!write(outputName, QJsonDocument(merged).toJson(QJsonDocument::Indented))) return "ERROR: Cannot save temporary model.";
+-		QString outputPath = temp.filePath(outputName);
+-		temp.setAutoRemove(false);
+-		return outputPath;
++		if (App->ExecDialog(&dialog) != QDialog::Accepted || !list.currentItem()) return "";
++		return prepare(list.currentItem()->text());
+ 	}
+ 
+ 	RealType lib_unzip(StringType src, StringType dst)

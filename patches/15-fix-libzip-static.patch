@@ -1,0 +1,13 @@
+diff --git a/CppProject/World/ModAssets.cpp b/CppProject/World/ModAssets.cpp
+index 606f029..c5da37a 100644
+--- a/CppProject/World/ModAssets.cpp
++++ b/CppProject/World/ModAssets.cpp
+@@ -13,6 +13,8 @@
+ 
+ #include "Generated/Scripts.hpp"
+ 
++// The project links libzip statically (as in Library/FileLib.cpp).
++#define ZIP_STATIC
+ #include <zip.h>
+ 
+ #include <QCryptographicHash>

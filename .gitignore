@@ -1,0 +1,18 @@
+# Build output and logs
+Logs/
+*.log
+CppGen/CppGen/bin/
+CppGen/CppGen/obj/
+**/CppGen/CppGen/bin/
+**/CppGen/CppGen/obj/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+
+# OS
+Thumbs.db
+desktop.ini

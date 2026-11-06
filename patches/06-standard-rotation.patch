@@ -1,0 +1,26 @@
+diff --git a/CppProject/Library/FileLib.cpp b/CppProject/Library/FileLib.cpp
+index 9e314c8..14d1d4b 100644
+--- a/CppProject/Library/FileLib.cpp
++++ b/CppProject/Library/FileLib.cpp
+@@ -380,8 +380,19 @@ namespace CppProject
+ 			if (!value.isObject()) return "ERROR: Invalid geometry element.";
+ 			QJsonObject element = value.toObject();
+ 			if (!numbers(element.value("from"), 3) || !numbers(element.value("to"), 3) || !element.value("faces").isObject()) return "ERROR: Unsupported geometry.";
+-			// Restrict rotations in the first version; do not silently misrepresent them.
+-			if (element.contains("rotation")) return "ERROR: Rotated geometry is not supported yet.";
++			// Mine-imator's block loader supports the standard Minecraft single-axis
++			// rotation with an origin and optional perpendicular rescaling.
++			if (element.contains("rotation")) {
++				if (!element.value("rotation").isObject()) return "ERROR: Invalid element rotation.";
++				QJsonObject rotation = element.value("rotation").toObject();
++				QString axis = rotation.value("axis").toString();
++				if (axis != "x" && axis != "y" && axis != "z") return "ERROR: Unsupported rotation axis.";
++				if (!rotation.value("angle").isDouble()) return "ERROR: Invalid rotation angle.";
++				double angle = rotation.value("angle").toDouble();
++				if (!std::isfinite(angle) || (angle != -45 && angle != -22.5 && angle != 0 && angle != 22.5 && angle != 45)) return "ERROR: Unsupported rotation angle.";
++				if (rotation.contains("origin") && !numbers(rotation.value("origin"), 3)) return "ERROR: Invalid rotation origin.";
++				if (rotation.contains("rescale") && !rotation.value("rescale").isBool()) return "ERROR: Invalid rotation rescale flag.";
++			}
+ 			if (element.contains("shade") && element.value("shade").isBool() && !element.value("shade").toBool()) return "ERROR: Unshaded elements are not supported yet.";
+ 			QJsonObject faces = element.value("faces").toObject();
+ 			if (faces.isEmpty()) return "ERROR: Empty model faces.";
