@@ -7,6 +7,9 @@ furniture and panel features, plus a small assistant that applies patches and dr
 > at commit `f2594272`. All upstream code, assets and trademarks remain the property of their
 > respective authors. This repository redistributes the upstream sources together with local
 > modifications.
+>
+> **Editing with AI?** Start with [AGENTS.md](AGENTS.md) — repository map, exact build commands
+> and editing rules.
 
 ## What's inside
 
